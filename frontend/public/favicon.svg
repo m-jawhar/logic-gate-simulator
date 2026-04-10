@@ -1,10 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Logic Gate Simulator">
   <rect width="64" height="64" rx="14" fill="#181825" />
-  <circle cx="18" cy="32" r="5" fill="#a6e3a1" />
-  <circle cx="18" cy="32" r="2" fill="#181825" />
-  <path d="M23 22h12c7 0 13 4.5 13 10s-6 10-13 10H23z" fill="none" stroke="#89b4fa" stroke-width="4" stroke-linejoin="round" />
-  <path d="M23 22c4 0 8 4.5 8 10s-4 10-8 10" fill="none" stroke="#89b4fa" stroke-width="4" stroke-linecap="round" />
-  <circle cx="45" cy="32" r="4.5" fill="#f9e2af" />
-  <path d="M45 18v7M45 39v7" stroke="#cdd6f4" stroke-width="3" stroke-linecap="round" />
-  <path d="M52 32h7" stroke="#cdd6f4" stroke-width="3" stroke-linecap="round" />
+  <path d="M18 20h18c7 0 12 5 12 12s-5 12-12 12H18z" fill="none" stroke="#89b4fa" stroke-width="5" stroke-linejoin="round" />
+  <path d="M18 20c5 0 9 5 9 12s-4 12-9 12" fill="none" stroke="#89b4fa" stroke-width="5" stroke-linecap="round" />
+  <circle cx="14" cy="32" r="3.5" fill="#a6e3a1" />
+  <circle cx="50" cy="32" r="3.5" fill="#f9e2af" />
 </svg>
