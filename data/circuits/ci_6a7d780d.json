@@ -1,0 +1,44 @@
+{
+  "inputs": [
+    {
+      "id": "in_a",
+      "name": "A",
+      "value": true,
+      "x": 10.0,
+      "y": 20.0
+    }
+  ],
+  "outputs": [
+    {
+      "id": "out_y",
+      "name": "Y",
+      "x": 30.0,
+      "y": 40.0
+    }
+  ],
+  "gates": [
+    {
+      "id": "g_1",
+      "type": "not",
+      "name": "NOT1",
+      "x": 15.0,
+      "y": 25.0
+    }
+  ],
+  "wires": [
+    {
+      "source_id": "in_a",
+      "source_type": "input",
+      "target_id": "g_1",
+      "target_type": "gate",
+      "target_input_index": 0
+    },
+    {
+      "source_id": "g_1",
+      "source_type": "gate",
+      "target_id": "out_y",
+      "target_type": "output",
+      "target_input_index": 0
+    }
+  ]
+}
