@@ -358,6 +358,14 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/storage/info")
+def storage_info() -> Dict[str, str]:
+    return {
+        "mode": "supabase" if _supabase_enabled() else "filesystem",
+        "table": SUPABASE_TABLE if _supabase_enabled() else "data/circuits",
+    }
+
+
 @app.get("/api/circuit/list", response_model=CircuitListResponse)
 def list_saved_circuits() -> CircuitListResponse:
     if _supabase_enabled():
