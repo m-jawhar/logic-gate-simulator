@@ -24,6 +24,7 @@ Thumbs.db
 # Local env
 .env
 .env.*
+context.txt
 
 # Build / coverage artifacts
 .coverage
