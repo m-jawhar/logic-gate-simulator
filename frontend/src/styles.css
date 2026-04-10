@@ -36,6 +36,10 @@ body {
   height: calc(100vh - 54px);
 }
 
+.mobile-pane-nav {
+  display: none;
+}
+
 .toolbox-pane,
 .right-pane {
   background: var(--panel);
@@ -124,6 +128,8 @@ select {
   background: transparent;
   padding: 0;
   text-align: left;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
 }
 
 .canvas-scroll svg {
@@ -151,6 +157,25 @@ select {
   font-size: 14px;
 }
 
+.panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.panel-heading h4 {
+  margin: 0;
+}
+
+.panel-toggle {
+  width: auto;
+  min-height: 30px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
 .panel-block pre {
   margin: 0;
   background: #1e2133;
@@ -175,7 +200,7 @@ select {
 .truth-table-scroll {
   flex: 1;
   min-height: 0;
-  overflow-y: scroll;
+  overflow-y: auto;
   overflow-x: auto;
 }
 
@@ -187,6 +212,7 @@ select {
 .toolbox-scroll,
 .canvas-scroll,
 .truth-table-scroll,
+.mobile-analysis-focus .right-pane,
 .truth-modal-pre {
   scrollbar-width: thin;
   scrollbar-color: #89b4fa #2b2d42;
@@ -195,6 +221,7 @@ select {
 .toolbox-scroll::-webkit-scrollbar,
 .canvas-scroll::-webkit-scrollbar,
 .truth-table-scroll::-webkit-scrollbar,
+.mobile-analysis-focus .right-pane::-webkit-scrollbar,
 .truth-modal-pre::-webkit-scrollbar {
   width: 12px;
   height: 12px;
@@ -203,6 +230,7 @@ select {
 .toolbox-scroll::-webkit-scrollbar-track,
 .canvas-scroll::-webkit-scrollbar-track,
 .truth-table-scroll::-webkit-scrollbar-track,
+.mobile-analysis-focus .right-pane::-webkit-scrollbar-track,
 .truth-modal-pre::-webkit-scrollbar-track {
   background: #2b2d42;
 }
@@ -210,6 +238,7 @@ select {
 .toolbox-scroll::-webkit-scrollbar-thumb,
 .canvas-scroll::-webkit-scrollbar-thumb,
 .truth-table-scroll::-webkit-scrollbar-thumb,
+.mobile-analysis-focus .right-pane::-webkit-scrollbar-thumb,
 .truth-modal-pre::-webkit-scrollbar-thumb {
   background: #89b4fa;
   border-radius: 10px;
@@ -219,6 +248,7 @@ select {
 .toolbox-scroll::-webkit-scrollbar-thumb:hover,
 .canvas-scroll::-webkit-scrollbar-thumb:hover,
 .truth-table-scroll::-webkit-scrollbar-thumb:hover,
+.mobile-analysis-focus .right-pane::-webkit-scrollbar-thumb:hover,
 .truth-modal-pre::-webkit-scrollbar-thumb:hover {
   background: #b4befe;
 }
@@ -283,16 +313,168 @@ select {
 }
 
 @media (max-width: 980px) {
+  .desktop-web-root {
+    height: auto;
+    min-height: 100vh;
+    overflow-y: auto;
+  }
+
   .workspace-row {
     grid-template-columns: 1fr;
     height: auto;
   }
 
+  .mobile-pane-nav {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+  }
+
+  .mobile-pane-nav button {
+    min-height: 40px;
+    border: 1px solid #6c7086;
+    background: #2b2d42;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .mobile-pane-nav button.active {
+    background: #45475a;
+    border-color: #89b4fa;
+  }
+
+  .mobile-hidden {
+    display: none;
+  }
+
+  .toolbox-pane,
+  .right-pane {
+    height: auto;
+  }
+
+  .toolbox-scroll {
+    max-height: 48vh;
+  }
+
   .canvas-pane {
-    height: 520px;
+    height: min(62vh, 520px);
   }
 
   .right-pane {
-    height: 600px;
+    min-height: 420px;
+  }
+
+  .panel-block {
+    min-height: 120px;
+  }
+
+  .panel-truth {
+    min-height: 260px;
+  }
+
+  .mobile-canvas-focus {
+    height: 100dvh;
+    min-height: 100dvh;
+    overflow: hidden;
+  }
+
+  .mobile-analysis-focus {
+    height: 100dvh;
+    min-height: 100dvh;
+    overflow: hidden;
+  }
+
+  .mobile-canvas-focus .workspace-row {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .mobile-analysis-focus .workspace-row {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .mobile-canvas-focus .canvas-pane {
+    height: 100%;
+  }
+
+  .mobile-analysis-focus .right-pane {
+    height: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .mobile-analysis-focus .panel-truth {
+    flex: 1;
+    min-height: 260px;
+  }
+
+  .mobile-analysis-focus .truth-table-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: visible;
+    max-height: none;
+  }
+
+  .mobile-canvas-focus .status-bar {
+    flex-shrink: 0;
+  }
+
+  .mobile-analysis-focus .status-bar {
+    flex-shrink: 0;
+  }
+}
+
+@media (max-width: 640px) {
+  .desktop-web-root {
+    padding: 4px;
+    gap: 4px;
+  }
+
+  .workspace-row {
+    gap: 4px;
+  }
+
+  .mobile-pane-nav {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--window);
+    padding-bottom: 2px;
+  }
+
+  .toolbox-scroll {
+    max-height: none;
+    padding: 8px;
+  }
+
+  .toolbox-scroll button,
+  .toolbox-scroll input,
+  .toolbox-scroll select,
+  .modal-header button {
+    font-size: 16px;
+    min-height: 42px;
+  }
+
+  .canvas-pane {
+    height: min(58vh, 460px);
+  }
+
+  .right-pane {
+    padding: 4px;
+    gap: 4px;
+    min-height: 360px;
+  }
+
+  .panel-block {
+    padding: 6px;
+  }
+
+  .status-bar {
+    font-size: 12px;
+    line-height: 1.3;
   }
 }

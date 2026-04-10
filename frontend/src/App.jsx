@@ -17,6 +17,9 @@ const NODE_SIZE = {
 
 const CANVAS_SIZE = { width: 2000, height: 2000 };
 const GRID_SPACING = 20;
+const MOBILE_BREAKPOINT = 980;
+const MOBILE_PANES = new Set(["components", "canvas", "analysis"]);
+const ANALYSIS_AUTO_COLLAPSE_ROWS = 16;
 
 const COLORS = {
   canvasBg: "#181825",
@@ -104,8 +107,6 @@ function valueToColor(value, unknownColor, trueColor, falseColor) {
 }
 
 export default function App() {
-  const [backendStatus, setBackendStatus] = useState("unknown");
-
   const [inputs, setInputs] = useState([]);
   const [gates, setGates] = useState([]);
   const [outputs, setOutputs] = useState([]);
@@ -127,10 +128,22 @@ export default function App() {
   const [circuitName, setCircuitName] = useState("demo_circuit");
   const [savedCircuits, setSavedCircuits] = useState([]);
   const [selectedSavedName, setSelectedSavedName] = useState("");
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return window.innerWidth <= MOBILE_BREAKPOINT;
+  });
+  const [mobilePane, setMobilePane] = useState("canvas");
+  const [analysisCollapsed, setAnalysisCollapsed] = useState({
+    properties: false,
+    expression: false,
+  });
 
   const inputCounter = useRef(0);
   const outputCounter = useRef(0);
   const gateCounter = useRef(0);
+  const lastAnalysisAutoLayoutRef = useRef("");
   const svgRef = useRef(null);
 
   const nodeById = useMemo(() => {
@@ -181,10 +194,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error("health check failed");
       }
-      const data = await response.json();
-      setBackendStatus(data.status || "ok");
     } catch {
-      setBackendStatus("offline");
       setStatusMessage(
         "API offline. Start backend with: uvicorn api:app --reload --port 8000",
       );
@@ -212,6 +222,69 @@ export default function App() {
     void checkBackend();
     void refreshSavedCircuits();
   }, []);
+
+  useEffect(() => {
+    function onResize() {
+      setIsMobile(window.innerWidth <= MOBILE_BREAKPOINT);
+    }
+
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    if (!isMobile && mobilePane !== "canvas") {
+      setMobilePane("canvas");
+    }
+  }, [isMobile, mobilePane]);
+
+  useEffect(() => {
+    function syncPaneFromHash() {
+      const hashPane = window.location.hash.replace("#", "");
+      if (MOBILE_PANES.has(hashPane)) {
+        setMobilePane(hashPane);
+      }
+    }
+
+    syncPaneFromHash();
+    window.addEventListener("hashchange", syncPaneFromHash);
+    return () => window.removeEventListener("hashchange", syncPaneFromHash);
+  }, []);
+
+  useEffect(() => {
+    if (!isMobile) {
+      return;
+    }
+
+    const nextHash = `#${mobilePane}`;
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, "", nextHash);
+    }
+  }, [isMobile, mobilePane]);
+
+  useEffect(() => {
+    if (!isMobile || mobilePane !== "analysis") {
+      return;
+    }
+
+    const table = simulateResult?.truth_table;
+    const rowCount = table?.rows?.length || 0;
+    const inputCount = table?.input_names?.length || 0;
+    const outputCount = table?.output_names?.length || 0;
+    const signature = `${rowCount}:${inputCount}:${outputCount}`;
+
+    if (lastAnalysisAutoLayoutRef.current === signature) {
+      return;
+    }
+
+    lastAnalysisAutoLayoutRef.current = signature;
+    const shouldCollapse = rowCount >= ANALYSIS_AUTO_COLLAPSE_ROWS;
+    setAnalysisCollapsed({
+      properties: shouldCollapse,
+      expression: shouldCollapse,
+    });
+  }, [isMobile, mobilePane, simulateResult]);
 
   function totalComponentCount() {
     return inputs.length + gates.length + outputs.length;
@@ -626,6 +699,13 @@ export default function App() {
       .join("\n\n");
   }
 
+  function toggleAnalysisSection(section) {
+    setAnalysisCollapsed((prev) => ({
+      ...prev,
+      [section]: !prev[section],
+    }));
+  }
+
   function wireStrokeColor(wire) {
     if (wire.source_type === "input") {
       const source = inputs.find((node) => node.id === wire.source_id);
@@ -695,9 +775,45 @@ export default function App() {
   }, []);
 
   return (
-    <div className="desktop-web-root">
+    <div
+      className={`desktop-web-root ${
+        isMobile && mobilePane === "canvas"
+          ? "mobile-canvas-focus"
+          : isMobile && mobilePane === "analysis"
+            ? "mobile-analysis-focus"
+            : ""
+      }`}
+    >
+      <div className="mobile-pane-nav">
+        <button
+          className={mobilePane === "components" ? "active" : ""}
+          onClick={() => setMobilePane("components")}
+          type="button"
+        >
+          Components
+        </button>
+        <button
+          className={mobilePane === "canvas" ? "active" : ""}
+          onClick={() => setMobilePane("canvas")}
+          type="button"
+        >
+          Canvas
+        </button>
+        <button
+          className={mobilePane === "analysis" ? "active" : ""}
+          onClick={() => setMobilePane("analysis")}
+          type="button"
+        >
+          Analysis
+        </button>
+      </div>
+
       <div className="workspace-row">
-        <aside className="toolbox-pane">
+        <aside
+          className={`toolbox-pane ${
+            isMobile && mobilePane !== "components" ? "mobile-hidden" : ""
+          }`}
+        >
           <div className="toolbox-scroll">
             <h3>Components</h3>
 
@@ -764,7 +880,11 @@ export default function App() {
           </div>
         </aside>
 
-        <section className="canvas-pane">
+        <section
+          className={`canvas-pane ${
+            isMobile && mobilePane !== "canvas" ? "mobile-hidden" : ""
+          }`}
+        >
           <div className="canvas-scroll">
             <svg
               ref={svgRef}
@@ -879,10 +999,10 @@ export default function App() {
                     <circle
                       cx={outputPos.x}
                       cy={outputPos.y}
-                      r="6"
+                      r={isMobile ? "8" : "6"}
                       fill={COLORS.connector}
                       stroke="#ffffff"
-                      strokeWidth="1"
+                      strokeWidth={isMobile ? "1.5" : "1"}
                       onClick={(event) =>
                         onConnectorClick(event, "input", node, "output")
                       }
@@ -933,10 +1053,10 @@ export default function App() {
                             <circle
                               cx={pos.x}
                               cy={pos.y}
-                              r="6"
+                              r={isMobile ? "8" : "6"}
                               fill={COLORS.connector}
                               stroke="#ffffff"
-                              strokeWidth="1"
+                              strokeWidth={isMobile ? "1.5" : "1"}
                               onClick={(event) =>
                                 onConnectorClick(
                                   event,
@@ -963,7 +1083,7 @@ export default function App() {
                     <circle
                       cx={outputPos.x}
                       cy={outputPos.y}
-                      r="6"
+                      r={isMobile ? "8" : "6"}
                       fill={valueToColor(
                         gateOutput,
                         COLORS.connector,
@@ -971,7 +1091,7 @@ export default function App() {
                         COLORS.outputOff,
                       )}
                       stroke="#ffffff"
-                      strokeWidth="1"
+                      strokeWidth={isMobile ? "1.5" : "1"}
                       onClick={(event) =>
                         onConnectorClick(event, "gate", node, "output")
                       }
@@ -1042,10 +1162,10 @@ export default function App() {
                     <circle
                       cx={inputPos.x}
                       cy={inputPos.y}
-                      r="6"
+                      r={isMobile ? "8" : "6"}
                       fill={COLORS.connector}
                       stroke="#ffffff"
-                      strokeWidth="1"
+                      strokeWidth={isMobile ? "1.5" : "1"}
                       onClick={(event) =>
                         onConnectorClick(event, "output", node, "input", 0)
                       }
@@ -1057,15 +1177,45 @@ export default function App() {
           </div>
         </section>
 
-        <aside className="right-pane">
+        <aside
+          className={`right-pane ${
+            isMobile && mobilePane !== "analysis" ? "mobile-hidden" : ""
+          }`}
+        >
           <section className="panel-block">
-            <h4>Properties</h4>
-            <pre>{selectedPropertiesText()}</pre>
+            <div className="panel-heading">
+              <h4>Properties</h4>
+              {isMobile && mobilePane === "analysis" ? (
+                <button
+                  className="panel-toggle"
+                  onClick={() => toggleAnalysisSection("properties")}
+                  type="button"
+                >
+                  {analysisCollapsed.properties ? "Expand" : "Collapse"}
+                </button>
+              ) : null}
+            </div>
+            {!analysisCollapsed.properties ? (
+              <pre>{selectedPropertiesText()}</pre>
+            ) : null}
           </section>
 
           <section className="panel-block">
-            <h4>Boolean Expression</h4>
-            <pre>{expressionText()}</pre>
+            <div className="panel-heading">
+              <h4>Boolean Expression</h4>
+              {isMobile && mobilePane === "analysis" ? (
+                <button
+                  className="panel-toggle"
+                  onClick={() => toggleAnalysisSection("expression")}
+                  type="button"
+                >
+                  {analysisCollapsed.expression ? "Expand" : "Collapse"}
+                </button>
+              ) : null}
+            </div>
+            {!analysisCollapsed.expression ? (
+              <pre>{expressionText()}</pre>
+            ) : null}
           </section>
 
           <section className="panel-block panel-truth">
@@ -1077,9 +1227,7 @@ export default function App() {
         </aside>
       </div>
 
-      <div className="status-bar">
-        {statusMessage} | Backend: {backendStatus}
-      </div>
+      <div className="status-bar">{statusMessage}</div>
 
       {showTruthModal ? (
         <div className="modal-overlay">
