@@ -1983,7 +1983,15 @@ export default function App() {
             isMobile && mobilePane !== "analysis" ? "mobile-hidden" : ""
           }`}
         >
-          <section className="panel-block">
+          <section
+            className={`panel-block ${
+              isMobile &&
+              mobilePane === "analysis" &&
+              analysisCollapsed.properties
+                ? "panel-collapsed"
+                : ""
+            }`}
+          >
             <div className="panel-heading">
               <h4>Properties</h4>
               {isMobile && mobilePane === "analysis" ? (
@@ -2001,7 +2009,15 @@ export default function App() {
             ) : null}
           </section>
 
-          <section className="panel-block">
+          <section
+            className={`panel-block ${
+              isMobile &&
+              mobilePane === "analysis" &&
+              analysisCollapsed.expression
+                ? "panel-collapsed"
+                : ""
+            }`}
+          >
             <div className="panel-heading">
               <h4>Boolean Expression</h4>
               {isMobile && mobilePane === "analysis" ? (

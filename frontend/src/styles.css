@@ -374,6 +374,14 @@ select {
     min-height: 120px;
   }
 
+  .panel-block.panel-collapsed {
+    min-height: 0;
+  }
+
+  .panel-block.panel-collapsed pre {
+    display: none;
+  }
+
   .panel-truth {
     min-height: 260px;
   }
