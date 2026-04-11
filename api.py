@@ -6,15 +6,21 @@ multiple clients (Tkinter desktop app, React web app, etc.) can share the
 same backend logic.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import time
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, cast
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from gates import (
@@ -106,6 +112,26 @@ class SimulationResponse(BaseModel):
     expressions: Dict[str, str]
 
 
+class AuthCredentials(BaseModel):
+    username: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+
+
+class AuthMeResponse(BaseModel):
+    username: str
+
+
+class ShareCircuitResponse(BaseModel):
+    share_id: str
+    share_path: str
+
+
 app = FastAPI(title="Logic Gate Simulator API", version="1.0.0")
 
 _cors_origins_raw = os.environ.get(
@@ -136,11 +162,18 @@ GATE_CLASSES = {
 
 PROJECT_DIR = Path(__file__).resolve().parent
 CIRCUITS_DIR = PROJECT_DIR / "data" / "circuits"
+PUBLIC_CIRCUITS_DIR = PROJECT_DIR / "data" / "public_circuits"
+USERS_FILE = PROJECT_DIR / "data" / "users.json"
 VALID_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 SUPABASE_URL = os.environ.get("LOGIC_SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("LOGIC_SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = os.environ.get("LOGIC_SUPABASE_TABLE", "circuits")
 SUPABASE_TIMEOUT_SECONDS = 8.0
+AUTH_SECRET = os.environ.get("LOGIC_AUTH_SECRET", "change-me-dev-secret")
+AUTH_TOKEN_TTL_SECONDS = int(os.environ.get("LOGIC_AUTH_TOKEN_TTL_SECONDS", "86400"))
+PASSWORD_HASH_ITERATIONS = int(os.environ.get("LOGIC_AUTH_HASH_ITERATIONS", "200000"))
+
+auth_scheme = HTTPBearer(auto_error=False)
 
 
 def _supabase_enabled() -> bool:
@@ -165,6 +198,181 @@ def _ensure_storage_dir() -> None:
     CIRCUITS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_users_file() -> None:
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not USERS_FILE.exists():
+        USERS_FILE.write_text("{}", encoding="utf-8")
+
+
+def _load_users() -> Dict[str, Dict[str, str]]:
+    _ensure_users_file()
+    try:
+        raw = USERS_FILE.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=500, detail="User store is invalid") from error
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail="User store is invalid")
+
+    users: Dict[str, Dict[str, str]] = {}
+    for username, profile in parsed.items():
+        if not isinstance(username, str) or not isinstance(profile, dict):
+            continue
+        salt = profile.get("salt")
+        password_hash = profile.get("password_hash")
+        if isinstance(salt, str) and isinstance(password_hash, str):
+            users[username] = {"salt": salt, "password_hash": password_hash}
+    return users
+
+
+def _save_users(users: Dict[str, Dict[str, str]]) -> None:
+    _ensure_users_file()
+    USERS_FILE.write_text(json.dumps(users, indent=2), encoding="utf-8")
+
+
+def _validate_username(username: str) -> str:
+    normalized = username.strip().lower()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Username cannot be empty")
+    if not VALID_NAME.fullmatch(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must match [A-Za-z0-9_-]",
+        )
+    if len(normalized) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 chars")
+    return normalized
+
+
+def _validate_password(password: str) -> str:
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 chars")
+    return password
+
+
+def _hash_password(password: str, salt: str) -> str:
+    hashed = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return hashed.hex()
+
+
+def _create_user(username: str, password: str) -> None:
+    normalized = _validate_username(username)
+    secret = _validate_password(password)
+    users = _load_users()
+    if normalized in users:
+        raise HTTPException(status_code=409, detail="Username already exists")
+
+    salt = secrets.token_hex(16)
+    users[normalized] = {
+        "salt": salt,
+        "password_hash": _hash_password(secret, salt),
+    }
+    _save_users(users)
+
+
+def _verify_user_credentials(username: str, password: str) -> bool:
+    normalized = _validate_username(username)
+    users = _load_users()
+    profile = users.get(normalized)
+    if not profile:
+        return False
+
+    candidate_hash = _hash_password(password, profile["salt"])
+    return hmac.compare_digest(candidate_hash, profile["password_hash"])
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(raw: str) -> bytes:
+    padding = "=" * (-len(raw) % 4)
+    return base64.urlsafe_b64decode(raw + padding)
+
+
+def _create_auth_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "exp": int(time.time()) + AUTH_TOKEN_TTL_SECONDS,
+    }
+    payload_b64 = _b64url_encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    )
+    signature = hmac.new(
+        AUTH_SECRET.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload_b64}.{signature}"
+
+
+def _verify_auth_token(token: str) -> str:
+    try:
+        payload_b64, provided_signature = token.split(".", 1)
+    except ValueError as error:
+        raise HTTPException(status_code=401, detail="Invalid auth token") from error
+
+    expected_signature = hmac.new(
+        AUTH_SECRET.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_signature, provided_signature):
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+
+    try:
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=401, detail="Invalid auth token") from error
+
+    username = payload.get("sub")
+    exp = payload.get("exp")
+    if not isinstance(username, str) or not isinstance(exp, int):
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+    if exp < int(time.time()):
+        raise HTTPException(status_code=401, detail="Token expired")
+
+    users = _load_users()
+    if username not in users:
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+    return username
+
+
+def _require_authenticated_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(auth_scheme),
+) -> str:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return _verify_auth_token(credentials.credentials)
+
+
+def _scoped_circuit_name(username: str, name: str) -> str:
+    return f"{username}::{_validate_circuit_name(name)}"
+
+
+def _display_name_from_scoped(username: str, scoped_name: str) -> Optional[str]:
+    prefix = f"{username}::"
+    if not scoped_name.startswith(prefix):
+        return None
+    return scoped_name[len(prefix) :]
+
+
+def _public_scoped_circuit_name(share_id: str) -> str:
+    safe_share_id = _validate_circuit_name(share_id)
+    return f"public::{safe_share_id}"
+
+
+def _new_share_id() -> str:
+    return f"sh_{secrets.token_hex(6)}"
+
+
 def _validate_circuit_name(name: str) -> str:
     normalized = name.strip()
     if not normalized:
@@ -182,7 +390,17 @@ def _circuit_file_path(name: str) -> Path:
     return CIRCUITS_DIR / f"{safe_name}.json"
 
 
-def _list_saved_circuits_supabase() -> List[str]:
+def _user_circuit_file_path(username: str, name: str) -> Path:
+    safe_name = _validate_circuit_name(name)
+    return CIRCUITS_DIR / username / f"{safe_name}.json"
+
+
+def _public_circuit_file_path(share_id: str) -> Path:
+    safe_share_id = _validate_circuit_name(share_id)
+    return PUBLIC_CIRCUITS_DIR / f"{safe_share_id}.json"
+
+
+def _list_saved_circuits_supabase(username: str) -> List[str]:
     try:
         with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
             response = client.get(
@@ -203,16 +421,24 @@ def _list_saved_circuits_supabase() -> List[str]:
         )
 
     rows = response.json()
-    return sorted(
-        row["name"]
-        for row in rows
-        if isinstance(row, dict) and isinstance(row.get("name"), str)
-    )
+    circuit_names: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_name = row.get("name")
+        if not isinstance(raw_name, str):
+            continue
+        display_name = _display_name_from_scoped(username, raw_name)
+        if display_name:
+            circuit_names.append(display_name)
+    return sorted(circuit_names)
 
 
-def _save_circuit_supabase(name: str, circuit_payload: CircuitPayload) -> None:
-    safe_name = _validate_circuit_name(name)
-    payload = [{"name": safe_name, "circuit": circuit_payload.model_dump()}]
+def _save_circuit_supabase(
+    username: str, name: str, circuit_payload: CircuitPayload
+) -> None:
+    scoped_name = _scoped_circuit_name(username, name)
+    payload = [{"name": scoped_name, "circuit": circuit_payload.model_dump()}]
 
     try:
         with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
@@ -237,14 +463,15 @@ def _save_circuit_supabase(name: str, circuit_payload: CircuitPayload) -> None:
         )
 
 
-def _load_circuit_supabase(name: str) -> Dict[str, object]:
+def _load_circuit_supabase(username: str, name: str) -> Dict[str, object]:
     safe_name = _validate_circuit_name(name)
+    scoped_name = _scoped_circuit_name(username, safe_name)
 
     try:
         with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
             response = client.get(
                 _supabase_base_url(),
-                params={"select": "circuit", "name": f"eq.{safe_name}", "limit": "1"},
+                params={"select": "circuit", "name": f"eq.{scoped_name}", "limit": "1"},
                 headers=_supabase_headers(),
             )
     except httpx.HTTPError as error:
@@ -270,6 +497,67 @@ def _load_circuit_supabase(name: str) -> Dict[str, object]:
             detail="Saved circuit payload is invalid",
         )
 
+    return circuit_data
+
+
+def _save_public_circuit_supabase(
+    share_id: str, circuit_payload: CircuitPayload
+) -> None:
+    scoped_name = _public_scoped_circuit_name(share_id)
+    payload = [{"name": scoped_name, "circuit": circuit_payload.model_dump()}]
+
+    try:
+        with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+            response = client.post(
+                _supabase_base_url(),
+                params={"on_conflict": "name"},
+                headers=_supabase_headers(
+                    prefer="resolution=merge-duplicates,return=minimal"
+                ),
+                json=payload,
+            )
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase public share failed: {error}",
+        ) from error
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase public share failed: {response.text}",
+        )
+
+
+def _load_public_circuit_supabase(share_id: str) -> Dict[str, object]:
+    scoped_name = _public_scoped_circuit_name(share_id)
+
+    try:
+        with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+            response = client.get(
+                _supabase_base_url(),
+                params={"select": "circuit", "name": f"eq.{scoped_name}", "limit": "1"},
+                headers=_supabase_headers(),
+            )
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase public load failed: {error}",
+        ) from error
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase public load failed: {response.text}",
+        )
+
+    rows = response.json()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Shared circuit not found")
+
+    circuit_data = rows[0].get("circuit")
+    if not isinstance(circuit_data, dict):
+        raise HTTPException(status_code=500, detail="Shared circuit payload is invalid")
     return circuit_data
 
 
@@ -358,6 +646,26 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/auth/register", response_model=AuthResponse)
+def register(credentials: AuthCredentials) -> AuthResponse:
+    username = _validate_username(credentials.username)
+    _create_user(username, credentials.password)
+    return AuthResponse(access_token=_create_auth_token(username), username=username)
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(credentials: AuthCredentials) -> AuthResponse:
+    username = _validate_username(credentials.username)
+    if not _verify_user_credentials(username, credentials.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return AuthResponse(access_token=_create_auth_token(username), username=username)
+
+
+@app.get("/api/auth/me", response_model=AuthMeResponse)
+def auth_me(username: str = Depends(_require_authenticated_user)) -> AuthMeResponse:
+    return AuthMeResponse(username=username)
+
+
 @app.get("/api/storage/info")
 def storage_info() -> Dict[str, str]:
     return {
@@ -367,37 +675,46 @@ def storage_info() -> Dict[str, str]:
 
 
 @app.get("/api/circuit/list", response_model=CircuitListResponse)
-def list_saved_circuits() -> CircuitListResponse:
+def list_saved_circuits(
+    username: str = Depends(_require_authenticated_user),
+) -> CircuitListResponse:
     if _supabase_enabled():
-        return CircuitListResponse(circuits=_list_saved_circuits_supabase())
+        return CircuitListResponse(circuits=_list_saved_circuits_supabase(username))
 
-    _ensure_storage_dir()
-    circuit_names = sorted(path.stem for path in CIRCUITS_DIR.glob("*.json"))
+    user_dir = CIRCUITS_DIR / username
+    user_dir.mkdir(parents=True, exist_ok=True)
+    circuit_names = sorted(path.stem for path in user_dir.glob("*.json"))
     return CircuitListResponse(circuits=circuit_names)
 
 
 @app.post("/api/circuit/save", response_model=SaveCircuitResponse)
-def save_circuit(request: SaveCircuitRequest) -> SaveCircuitResponse:
+def save_circuit(
+    request: SaveCircuitRequest,
+    username: str = Depends(_require_authenticated_user),
+) -> SaveCircuitResponse:
     safe_name = _validate_circuit_name(request.name)
 
     if _supabase_enabled():
-        _save_circuit_supabase(safe_name, request.circuit)
+        _save_circuit_supabase(username, safe_name, request.circuit)
         return SaveCircuitResponse(name=safe_name, saved=True)
 
-    _ensure_storage_dir()
-    file_path = _circuit_file_path(safe_name)
+    file_path = _user_circuit_file_path(username, safe_name)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     with file_path.open("w", encoding="utf-8") as file_handle:
         json.dump(request.circuit.model_dump(), file_handle, indent=2)
     return SaveCircuitResponse(name=safe_name, saved=True)
 
 
 @app.get("/api/circuit/load/{name}", response_model=SimulationRequest)
-def load_circuit(name: str) -> SimulationRequest:
+def load_circuit(
+    name: str,
+    username: str = Depends(_require_authenticated_user),
+) -> SimulationRequest:
     if _supabase_enabled():
-        circuit_data = _load_circuit_supabase(name)
+        circuit_data = _load_circuit_supabase(username, name)
         return SimulationRequest(circuit=CircuitPayload(**circuit_data))
 
-    file_path = _circuit_file_path(name)
+    file_path = _user_circuit_file_path(username, name)
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"Circuit '{name}' not found")
 
@@ -407,6 +724,68 @@ def load_circuit(name: str) -> SimulationRequest:
     except json.JSONDecodeError as error:
         raise HTTPException(
             status_code=500, detail="Saved circuit file is invalid"
+        ) from error
+
+    return SimulationRequest(circuit=CircuitPayload(**circuit_data))
+
+
+@app.post("/api/circuit/share/{name}", response_model=ShareCircuitResponse)
+def share_circuit(
+    name: str,
+    username: str = Depends(_require_authenticated_user),
+) -> ShareCircuitResponse:
+    safe_name = _validate_circuit_name(name)
+    share_id = _new_share_id()
+
+    if _supabase_enabled():
+        source_circuit = _load_circuit_supabase(username, safe_name)
+        _save_public_circuit_supabase(share_id, CircuitPayload(**source_circuit))
+        return ShareCircuitResponse(
+            share_id=share_id,
+            share_path=f"/?share={share_id}",
+        )
+
+    source_file = _user_circuit_file_path(username, safe_name)
+    if not source_file.exists():
+        raise HTTPException(status_code=404, detail=f"Circuit '{safe_name}' not found")
+
+    try:
+        with source_file.open("r", encoding="utf-8") as file_handle:
+            circuit_data = json.load(file_handle)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=500, detail="Saved circuit file is invalid"
+        ) from error
+
+    PUBLIC_CIRCUITS_DIR.mkdir(parents=True, exist_ok=True)
+    public_file = _public_circuit_file_path(share_id)
+    with public_file.open("w", encoding="utf-8") as file_handle:
+        json.dump(circuit_data, file_handle, indent=2)
+
+    return ShareCircuitResponse(
+        share_id=share_id,
+        share_path=f"/?share={share_id}",
+    )
+
+
+@app.get("/api/public/circuit/{share_id}", response_model=SimulationRequest)
+def load_public_shared_circuit(share_id: str) -> SimulationRequest:
+    safe_share_id = _validate_circuit_name(share_id)
+
+    if _supabase_enabled():
+        circuit_data = _load_public_circuit_supabase(safe_share_id)
+        return SimulationRequest(circuit=CircuitPayload(**circuit_data))
+
+    public_file = _public_circuit_file_path(safe_share_id)
+    if not public_file.exists():
+        raise HTTPException(status_code=404, detail="Shared circuit not found")
+
+    try:
+        with public_file.open("r", encoding="utf-8") as file_handle:
+            circuit_data = json.load(file_handle)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=500, detail="Shared circuit payload is invalid"
         ) from error
 
     return SimulationRequest(circuit=CircuitPayload(**circuit_data))

@@ -93,6 +93,48 @@ npm run dev
 
 Open the frontend at `http://127.0.0.1:5173`.
 
+### Authentication (New)
+
+Persistence routes are now protected by bearer-token auth:
+
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `GET /api/auth/me`
+
+Protected routes (require `Authorization: Bearer <token>`):
+
+- `GET /api/circuit/list`
+- `POST /api/circuit/save`
+- `GET /api/circuit/load/{name}`
+- `POST /api/circuit/share/{name}`
+
+Public read-only route (no auth required):
+
+- `GET /api/public/circuit/{share_id}`
+
+The web app includes built-in **Register / Login / Logout** controls in the left panel and automatically sends the token for save/load/list.
+
+### Optional Public Sharing (Read-only)
+
+Authenticated users can create a share link for any saved circuit:
+
+1. Save a circuit.
+2. Select it in **Saved Circuits**.
+3. Click **Share Selected (Read-only)**.
+
+The generated link (`/?share=<share_id>`) loads the shared circuit for anyone with the URL.
+This is read-only from a storage perspective: public users can view/simulate that shared snapshot, but they cannot overwrite your private saved circuits.
+
+Environment variables:
+
+```text
+LOGIC_AUTH_SECRET=change-this-in-production
+LOGIC_AUTH_TOKEN_TTL_SECONDS=86400
+LOGIC_AUTH_HASH_ITERATIONS=200000
+```
+
+If you deploy publicly, set a strong `LOGIC_AUTH_SECRET`.
+
 ### Run Desktop and Web Together
 
 Use separate processes to avoid event-loop blocking:

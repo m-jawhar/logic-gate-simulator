@@ -1,7 +1,7 @@
 """Unit tests for FastAPI backend endpoints."""
 
-import uuid
 import unittest
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -11,6 +11,16 @@ from api import app
 class TestLogicApi(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
+        self.username = f"user_{uuid.uuid4().hex[:8]}"
+        self.password = "password123"
+
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={"username": self.username, "password": self.password},
+        )
+        self.assertEqual(register_response.status_code, 200)
+        token = register_response.json()["access_token"]
+        self.auth_headers = {"Authorization": f"Bearer {token}"}
 
     def test_health(self):
         response = self.client.get("/health")
@@ -130,15 +140,21 @@ class TestLogicApi(unittest.TestCase):
             },
         }
 
-        save_response = self.client.post("/api/circuit/save", json=payload)
+        save_response = self.client.post(
+            "/api/circuit/save",
+            json=payload,
+            headers=self.auth_headers,
+        )
         self.assertEqual(save_response.status_code, 200)
         self.assertEqual(save_response.json()["name"], circuit_name)
 
-        list_response = self.client.get("/api/circuit/list")
+        list_response = self.client.get("/api/circuit/list", headers=self.auth_headers)
         self.assertEqual(list_response.status_code, 200)
         self.assertIn(circuit_name, list_response.json()["circuits"])
 
-        load_response = self.client.get(f"/api/circuit/load/{circuit_name}")
+        load_response = self.client.get(
+            f"/api/circuit/load/{circuit_name}", headers=self.auth_headers
+        )
         self.assertEqual(load_response.status_code, 200)
         loaded_circuit = load_response.json()["circuit"]
         self.assertEqual(loaded_circuit["inputs"][0]["name"], "A")
@@ -146,8 +162,62 @@ class TestLogicApi(unittest.TestCase):
 
     def test_load_missing_circuit(self):
         missing_name = f"missing_{uuid.uuid4().hex[:8]}"
-        response = self.client.get(f"/api/circuit/load/{missing_name}")
+        response = self.client.get(
+            f"/api/circuit/load/{missing_name}", headers=self.auth_headers
+        )
         self.assertEqual(response.status_code, 404)
+
+    def test_auth_login(self):
+        login_response = self.client.post(
+            "/api/auth/login",
+            json={"username": self.username, "password": self.password},
+        )
+        self.assertEqual(login_response.status_code, 200)
+        self.assertIn("access_token", login_response.json())
+
+    def test_persistence_requires_auth(self):
+        response = self.client.get("/api/circuit/list")
+        self.assertEqual(response.status_code, 401)
+
+    def test_public_shared_circuit_read_only_link(self):
+        circuit_name = f"ci_{uuid.uuid4().hex[:8]}"
+        payload = {
+            "name": circuit_name,
+            "circuit": {
+                "inputs": [{"id": "in_a", "name": "A", "value": True}],
+                "outputs": [{"id": "out_y", "name": "Y"}],
+                "gates": [],
+                "wires": [
+                    {
+                        "source_id": "in_a",
+                        "source_type": "input",
+                        "target_id": "out_y",
+                        "target_type": "output",
+                        "target_input_index": 0,
+                    }
+                ],
+            },
+        }
+
+        save_response = self.client.post(
+            "/api/circuit/save",
+            json=payload,
+            headers=self.auth_headers,
+        )
+        self.assertEqual(save_response.status_code, 200)
+
+        share_response = self.client.post(
+            f"/api/circuit/share/{circuit_name}",
+            headers=self.auth_headers,
+        )
+        self.assertEqual(share_response.status_code, 200)
+        share_id = share_response.json()["share_id"]
+
+        public_load_response = self.client.get(f"/api/public/circuit/{share_id}")
+        self.assertEqual(public_load_response.status_code, 200)
+        self.assertEqual(
+            public_load_response.json()["circuit"]["inputs"][0]["name"], "A"
+        )
 
 
 if __name__ == "__main__":

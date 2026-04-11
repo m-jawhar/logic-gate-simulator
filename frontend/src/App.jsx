@@ -20,6 +20,9 @@ const GRID_SPACING = 20;
 const MOBILE_BREAKPOINT = 980;
 const MOBILE_PANES = new Set(["components", "canvas", "analysis"]);
 const ANALYSIS_AUTO_COLLAPSE_ROWS = 16;
+const MAX_HISTORY_STEPS = 100;
+const AUTH_TOKEN_KEY = "logic_auth_token";
+const AUTH_USER_KEY = "logic_auth_user";
 
 const COLORS = {
   canvasBg: "#181825",
@@ -128,6 +131,21 @@ export default function App() {
   const [circuitName, setCircuitName] = useState("demo_circuit");
   const [savedCircuits, setSavedCircuits] = useState([]);
   const [selectedSavedName, setSelectedSavedName] = useState("");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authToken, setAuthToken] = useState(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+    return window.localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  });
+  const [authUser, setAuthUser] = useState(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+    return window.localStorage.getItem(AUTH_USER_KEY) || "";
+  });
+  const [sharedLink, setSharedLink] = useState("");
   const [isMobile, setIsMobile] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -139,11 +157,14 @@ export default function App() {
     properties: false,
     expression: false,
   });
+  const [historyPast, setHistoryPast] = useState([]);
+  const [historyFuture, setHistoryFuture] = useState([]);
 
   const inputCounter = useRef(0);
   const outputCounter = useRef(0);
   const gateCounter = useRef(0);
   const lastAnalysisAutoLayoutRef = useRef("");
+  const dragStartSnapshotRef = useRef(null);
   const svgRef = useRef(null);
 
   const nodeById = useMemo(() => {
@@ -165,10 +186,114 @@ export default function App() {
     };
   }
 
+  function getAuthHeaders() {
+    if (!authToken) {
+      return {};
+    }
+    return { Authorization: `Bearer ${authToken}` };
+  }
+
+  function toAbsoluteShareLink(path) {
+    if (typeof window === "undefined") {
+      return path;
+    }
+    return `${window.location.origin}${path}`;
+  }
+
   function syncCounters(nextInputs, nextOutputs, nextGates) {
     inputCounter.current = nextInputs.length;
     outputCounter.current = nextOutputs.length;
     gateCounter.current = nextGates.length;
+  }
+
+  function cloneValue(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function snapshotSignature(snapshot) {
+    return JSON.stringify(snapshot);
+  }
+
+  function captureSnapshot() {
+    return {
+      inputs: cloneValue(inputs),
+      outputs: cloneValue(outputs),
+      gates: cloneValue(gates),
+      wires: cloneValue(wires),
+      selectedNode: selectedNode ? cloneValue(selectedNode) : null,
+    };
+  }
+
+  function pushUndoSnapshot() {
+    const snapshot = captureSnapshot();
+    const signature = snapshotSignature(snapshot);
+    setHistoryPast((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.signature === signature) {
+        return prev;
+      }
+      return [...prev, { signature, snapshot }].slice(-MAX_HISTORY_STEPS);
+    });
+    setHistoryFuture([]);
+  }
+
+  function restoreSnapshot(snapshot, statusText) {
+    setInputs(snapshot.inputs || []);
+    setOutputs(snapshot.outputs || []);
+    setGates(snapshot.gates || []);
+    setWires(snapshot.wires || []);
+    syncCounters(
+      snapshot.inputs || [],
+      snapshot.outputs || [],
+      snapshot.gates || [],
+    );
+    setSelectedNode(snapshot.selectedNode || null);
+    setWireStart(null);
+    setPreviewPoint(null);
+    setSimulateResult(null);
+    setStatusMessage(statusText);
+    queueMicrotask(() => void simulateCircuit(false));
+  }
+
+  function undoCircuit() {
+    if (!historyPast.length) {
+      setStatusMessage("Nothing to undo.");
+      return;
+    }
+
+    const current = captureSnapshot();
+    const currentSignature = snapshotSignature(current);
+    const previousEntry = historyPast[historyPast.length - 1];
+
+    setHistoryPast((prev) => prev.slice(0, -1));
+    setHistoryFuture((prev) =>
+      [{ signature: currentSignature, snapshot: current }, ...prev].slice(
+        0,
+        MAX_HISTORY_STEPS,
+      ),
+    );
+
+    restoreSnapshot(previousEntry.snapshot, "Undo applied.");
+  }
+
+  function redoCircuit() {
+    if (!historyFuture.length) {
+      setStatusMessage("Nothing to redo.");
+      return;
+    }
+
+    const current = captureSnapshot();
+    const currentSignature = snapshotSignature(current);
+    const nextEntry = historyFuture[0];
+
+    setHistoryFuture((prev) => prev.slice(1));
+    setHistoryPast((prev) =>
+      [...prev, { signature: currentSignature, snapshot: current }].slice(
+        -MAX_HISTORY_STEPS,
+      ),
+    );
+
+    restoreSnapshot(nextEntry.snapshot, "Redo applied.");
   }
 
   function applyCircuitPayload(circuit) {
@@ -201,11 +326,23 @@ export default function App() {
     }
   }
 
-  async function refreshSavedCircuits() {
+  async function refreshSavedCircuits(tokenOverride = authToken) {
+    if (!tokenOverride) {
+      setSavedCircuits([]);
+      setSelectedSavedName("");
+      return;
+    }
+
     try {
-      const response = await fetch("/api/circuit/list");
+      const response = await fetch("/api/circuit/list", {
+        headers: { Authorization: `Bearer ${tokenOverride}` },
+      });
       const data = await response.json();
       if (!response.ok) {
+        if (response.status === 401) {
+          setAuthToken("");
+          setAuthUser("");
+        }
         throw new Error(data.detail || "Could not list saved circuits");
       }
       setSavedCircuits(data.circuits || []);
@@ -220,7 +357,50 @@ export default function App() {
 
   useEffect(() => {
     void checkBackend();
+  }, []);
+
+  useEffect(() => {
+    if (!authToken) {
+      setSavedCircuits([]);
+      setSelectedSavedName("");
+      return;
+    }
+
     void refreshSavedCircuits();
+  }, [authToken]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const shareId = params.get("share");
+    if (!shareId) {
+      return;
+    }
+
+    async function loadSharedCircuit() {
+      try {
+        const response = await fetch(
+          `/api/public/circuit/${encodeURIComponent(shareId)}`,
+        );
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || "Could not load shared circuit");
+        }
+
+        pushUndoSnapshot();
+        applyCircuitPayload(data.circuit);
+        setStatusMessage(`Loaded shared circuit ${shareId}`);
+        setSharedLink(toAbsoluteShareLink(`/?share=${shareId}`));
+        queueMicrotask(() => void simulateCircuit(false));
+      } catch (error) {
+        setStatusMessage(error.message);
+      }
+    }
+
+    void loadSharedCircuit();
   }, []);
 
   useEffect(() => {
@@ -264,6 +444,24 @@ export default function App() {
   }, [isMobile, mobilePane]);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (authToken) {
+      window.localStorage.setItem(AUTH_TOKEN_KEY, authToken);
+    } else {
+      window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    }
+
+    if (authUser) {
+      window.localStorage.setItem(AUTH_USER_KEY, authUser);
+    } else {
+      window.localStorage.removeItem(AUTH_USER_KEY);
+    }
+  }, [authToken, authUser]);
+
+  useEffect(() => {
     if (!isMobile || mobilePane !== "analysis") {
       return;
     }
@@ -291,6 +489,7 @@ export default function App() {
   }
 
   function addInputNode() {
+    pushUndoSnapshot();
     inputCounter.current += 1;
     const y = 100 + totalComponentCount() * 80;
     const next = {
@@ -306,6 +505,7 @@ export default function App() {
   }
 
   function addOutputNode() {
+    pushUndoSnapshot();
     outputCounter.current += 1;
     const y = 100 + totalComponentCount() * 80;
     const next = {
@@ -320,6 +520,7 @@ export default function App() {
   }
 
   function addGate(type) {
+    pushUndoSnapshot();
     gateCounter.current += 1;
     const y = 100 + totalComponentCount() * 80;
     const next = {
@@ -335,6 +536,7 @@ export default function App() {
   }
 
   function addWireFromClick(source, target, targetInputIndex = 0) {
+    pushUndoSnapshot();
     const sourceType = source.kind === "input" ? "input" : "gate";
     const targetType = target.kind === "output" ? "output" : "gate";
 
@@ -377,6 +579,7 @@ export default function App() {
     if (wireMode) {
       return;
     }
+    pushUndoSnapshot();
     setInputs((prev) =>
       prev.map((item) =>
         item.id === node.id ? { ...item, value: !item.value } : item,
@@ -434,6 +637,11 @@ export default function App() {
       return;
     }
     event.stopPropagation();
+    const startSnapshot = captureSnapshot();
+    dragStartSnapshotRef.current = {
+      signature: snapshotSignature(startSnapshot),
+      snapshot: startSnapshot,
+    };
     const bounds = event.currentTarget.ownerSVGElement.getBoundingClientRect();
     const cursorX = event.clientX - bounds.left;
     const cursorY = event.clientY - bounds.top;
@@ -489,6 +697,17 @@ export default function App() {
 
   function onCanvasMouseUp() {
     if (dragInfo) {
+      const currentSignature = snapshotSignature(captureSnapshot());
+      if (
+        dragStartSnapshotRef.current &&
+        dragStartSnapshotRef.current.signature !== currentSignature
+      ) {
+        setHistoryPast((prev) =>
+          [...prev, dragStartSnapshotRef.current].slice(-MAX_HISTORY_STEPS),
+        );
+        setHistoryFuture([]);
+      }
+      dragStartSnapshotRef.current = null;
       setDragInfo(null);
       void simulateCircuit(false);
     }
@@ -520,6 +739,8 @@ export default function App() {
       return;
     }
 
+    pushUndoSnapshot();
+
     const { kind, id } = selectedNode;
 
     if (kind === "input") {
@@ -547,6 +768,8 @@ export default function App() {
     if (!confirmed) {
       return;
     }
+
+    pushUndoSnapshot();
 
     setInputs([]);
     setGates([]);
@@ -599,6 +822,11 @@ export default function App() {
   }
 
   async function saveCircuit() {
+    if (!authToken) {
+      setStatusMessage("Sign in to save circuits.");
+      return;
+    }
+
     const safeName = normalizeName(circuitName);
     if (!safeName) {
       setStatusMessage("Provide a circuit name before saving.");
@@ -608,7 +836,10 @@ export default function App() {
     try {
       const response = await fetch("/api/circuit/save", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeaders(),
+        },
         body: JSON.stringify({
           name: safeName,
           circuit: buildCircuitPayload().circuit,
@@ -616,6 +847,10 @@ export default function App() {
       });
       const data = await response.json();
       if (!response.ok) {
+        if (response.status === 401) {
+          setAuthToken("");
+          setAuthUser("");
+        }
         throw new Error(data.detail || "Save failed");
       }
       setStatusMessage(`Saved circuit as ${data.name}`);
@@ -627,6 +862,11 @@ export default function App() {
   }
 
   async function loadCircuit() {
+    if (!authToken) {
+      setStatusMessage("Sign in to load circuits.");
+      return;
+    }
+
     if (!selectedSavedName) {
       setStatusMessage("Choose a saved circuit to load.");
       return;
@@ -635,17 +875,125 @@ export default function App() {
     try {
       const response = await fetch(
         `/api/circuit/load/${encodeURIComponent(selectedSavedName)}`,
+        {
+          headers: getAuthHeaders(),
+        },
       );
       const data = await response.json();
       if (!response.ok) {
+        if (response.status === 401) {
+          setAuthToken("");
+          setAuthUser("");
+        }
         throw new Error(data.detail || "Load failed");
       }
+      pushUndoSnapshot();
       applyCircuitPayload(data.circuit);
       setStatusMessage(`Loaded ${selectedSavedName}`);
       queueMicrotask(() => void simulateCircuit(false));
     } catch (error) {
       setStatusMessage(error.message);
     }
+  }
+
+  async function shareSelectedCircuit() {
+    if (!authToken) {
+      setStatusMessage("Sign in to create share links.");
+      return;
+    }
+    if (!selectedSavedName) {
+      setStatusMessage("Select a saved circuit before sharing.");
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `/api/circuit/share/${encodeURIComponent(selectedSavedName)}`,
+        {
+          method: "POST",
+          headers: getAuthHeaders(),
+        },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        if (response.status === 401) {
+          setAuthToken("");
+          setAuthUser("");
+        }
+        throw new Error(data.detail || "Share failed");
+      }
+
+      const nextLink = toAbsoluteShareLink(data.share_path);
+      setSharedLink(nextLink);
+      setStatusMessage(
+        "Share link created (read-only). Anyone with link can view.",
+      );
+    } catch (error) {
+      setStatusMessage(error.message);
+    }
+  }
+
+  async function copySharedLink() {
+    if (!sharedLink) {
+      setStatusMessage("No share link available.");
+      return;
+    }
+
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(sharedLink);
+        setStatusMessage("Share link copied.");
+      } else {
+        setStatusMessage("Clipboard API unavailable. Copy link manually.");
+      }
+    } catch {
+      setStatusMessage("Could not copy link. Copy manually.");
+    }
+  }
+
+  async function submitAuth(path) {
+    const username = authUsername.trim().toLowerCase();
+    if (!username || !authPassword) {
+      setStatusMessage("Enter username and password.");
+      return;
+    }
+
+    try {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password: authPassword }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Authentication failed");
+      }
+
+      setAuthToken(data.access_token);
+      setAuthUser(data.username);
+      setAuthPassword("");
+      setStatusMessage(`Signed in as ${data.username}`);
+      await refreshSavedCircuits(data.access_token);
+    } catch (error) {
+      setStatusMessage(error.message);
+    }
+  }
+
+  async function registerAuth() {
+    await submitAuth("/api/auth/register");
+  }
+
+  async function loginAuth() {
+    await submitAuth("/api/auth/login");
+  }
+
+  function logoutAuth() {
+    setAuthToken("");
+    setAuthUser("");
+    setAuthPassword("");
+    setSavedCircuits([]);
+    setSelectedSavedName("");
+    setStatusMessage("Signed out.");
   }
 
   function selectedPropertiesText() {
@@ -731,6 +1079,21 @@ export default function App() {
 
   useEffect(() => {
     function onKeyDown(event) {
+      const key = event.key.toLowerCase();
+      const hasCommandKey = event.ctrlKey || event.metaKey;
+
+      if (hasCommandKey && key === "z" && !event.shiftKey) {
+        event.preventDefault();
+        undoCircuit();
+        return;
+      }
+
+      if (hasCommandKey && (key === "y" || (key === "z" && event.shiftKey))) {
+        event.preventDefault();
+        redoCircuit();
+        return;
+      }
+
       if (event.key === "Delete") {
         deleteSelected();
       }
@@ -837,6 +1200,12 @@ export default function App() {
             <button onClick={toggleWireMode}>
               Wire Mode: {wireMode ? "ON" : "OFF"}
             </button>
+            <button onClick={undoCircuit} disabled={!historyPast.length}>
+              Undo (Ctrl/Cmd+Z)
+            </button>
+            <button onClick={redoCircuit} disabled={!historyFuture.length}>
+              Redo (Ctrl/Cmd+Y)
+            </button>
             <button onClick={deleteSelected}>Delete Selected</button>
             <button onClick={clearCircuit}>Clear Circuit</button>
 
@@ -844,6 +1213,40 @@ export default function App() {
 
             <button onClick={() => void simulateCircuit(true)}>Simulate</button>
             <button onClick={openTruthTable}>Truth Table</button>
+
+            <hr />
+
+            <h4>Auth</h4>
+            <label className="mini-label" htmlFor="authUsername">
+              Username
+            </label>
+            <input
+              id="authUsername"
+              value={authUsername}
+              onChange={(event) => setAuthUsername(event.target.value)}
+              placeholder="your_username"
+            />
+
+            <label className="mini-label" htmlFor="authPassword">
+              Password
+            </label>
+            <input
+              id="authPassword"
+              type="password"
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+              placeholder="at least 8 characters"
+            />
+
+            <button onClick={registerAuth}>Register</button>
+            <button onClick={loginAuth}>Login</button>
+            <button onClick={logoutAuth} disabled={!authToken}>
+              Logout
+            </button>
+
+            <div className="mini-label">
+              Current User: {authUser || "Guest"}
+            </div>
 
             <hr />
 
@@ -855,8 +1258,11 @@ export default function App() {
               id="circuitName"
               value={circuitName}
               onChange={(event) => setCircuitName(event.target.value)}
+              disabled={!authToken}
             />
-            <button onClick={saveCircuit}>Save To API</button>
+            <button onClick={saveCircuit} disabled={!authToken}>
+              Save To API
+            </button>
 
             <label className="mini-label" htmlFor="savedCircuitSelect">
               Saved Circuits
@@ -865,6 +1271,7 @@ export default function App() {
               id="savedCircuitSelect"
               value={selectedSavedName}
               onChange={(event) => setSelectedSavedName(event.target.value)}
+              disabled={!authToken}
             >
               <option value="">Select saved circuit</option>
               {savedCircuits.map((name) => (
@@ -873,9 +1280,33 @@ export default function App() {
                 </option>
               ))}
             </select>
-            <button onClick={loadCircuit}>Load From API</button>
-            <button onClick={() => void refreshSavedCircuits()}>
+            <button onClick={loadCircuit} disabled={!authToken}>
+              Load From API
+            </button>
+            <button
+              onClick={shareSelectedCircuit}
+              disabled={!authToken || !selectedSavedName}
+            >
+              Share Selected (Read-only)
+            </button>
+            <button
+              onClick={() => void refreshSavedCircuits()}
+              disabled={!authToken}
+            >
               Refresh List
+            </button>
+
+            <label className="mini-label" htmlFor="shareLink">
+              Public Share Link
+            </label>
+            <input
+              id="shareLink"
+              value={sharedLink}
+              readOnly
+              placeholder="(none)"
+            />
+            <button onClick={copySharedLink} disabled={!sharedLink}>
+              Copy Share Link
             </button>
           </div>
         </aside>
