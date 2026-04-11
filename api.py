@@ -40,7 +40,10 @@ from simulation import Circuit, SimulationEngine
 
 class GateSpec(BaseModel):
     id: str = Field(..., description="Unique gate identifier")
-    type: Literal["and", "or", "not", "nand", "nor", "xor"]
+    type: str = Field(
+        ...,
+        description="Built-in gate type or custom gate type in form custom:<name>",
+    )
     name: Optional[str] = None
     x: float = 0.0
     y: float = 0.0
@@ -112,6 +115,16 @@ class SimulationResponse(BaseModel):
     expressions: Dict[str, str]
 
 
+class TimingSignal(BaseModel):
+    name: str
+    values: List[bool]
+
+
+class TimingResponse(BaseModel):
+    steps: List[int]
+    signals: List[TimingSignal]
+
+
 class AuthCredentials(BaseModel):
     username: str
     password: str
@@ -130,6 +143,32 @@ class AuthMeResponse(BaseModel):
 class ShareCircuitResponse(BaseModel):
     share_id: str
     share_path: str
+
+
+class CreateCustomGateRequest(BaseModel):
+    name: str
+    circuit: CircuitPayload
+    output_name: Optional[str] = None
+
+
+class CustomGateDefinition(BaseModel):
+    name: str
+    input_names: List[str]
+    expression: str
+
+
+class CustomGateListResponse(BaseModel):
+    gates: List[CustomGateDefinition]
+
+
+class ShareCustomGateResponse(BaseModel):
+    share_id: str
+    share_path: str
+    gate: CustomGateDefinition
+
+
+class ImportCustomGateRequest(BaseModel):
+    name: Optional[str] = None
 
 
 app = FastAPI(title="Logic Gate Simulator API", version="1.0.0")
@@ -164,10 +203,20 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CIRCUITS_DIR = PROJECT_DIR / "data" / "circuits"
 PUBLIC_CIRCUITS_DIR = PROJECT_DIR / "data" / "public_circuits"
 USERS_FILE = PROJECT_DIR / "data" / "users.json"
+CUSTOM_GATES_FILE = PROJECT_DIR / "data" / "custom_gates.json"
+PUBLIC_CUSTOM_GATES_FILE = PROJECT_DIR / "data" / "public_custom_gates.json"
 VALID_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+VALID_SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SUPABASE_URL = os.environ.get("LOGIC_SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("LOGIC_SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = os.environ.get("LOGIC_SUPABASE_TABLE", "circuits")
+SUPABASE_USERS_TABLE = os.environ.get("LOGIC_SUPABASE_USERS_TABLE", "logic_users")
+SUPABASE_CUSTOM_GATES_TABLE = os.environ.get(
+    "LOGIC_SUPABASE_CUSTOM_GATES_TABLE", "custom_gates"
+)
+SUPABASE_PUBLIC_CUSTOM_GATES_TABLE = os.environ.get(
+    "LOGIC_SUPABASE_PUBLIC_CUSTOM_GATES_TABLE", "public_custom_gates"
+)
 SUPABASE_TIMEOUT_SECONDS = 8.0
 AUTH_SECRET = os.environ.get("LOGIC_AUTH_SECRET", "change-me-dev-secret")
 AUTH_TOKEN_TTL_SECONDS = int(os.environ.get("LOGIC_AUTH_TOKEN_TTL_SECONDS", "86400"))
@@ -176,12 +225,58 @@ PASSWORD_HASH_ITERATIONS = int(os.environ.get("LOGIC_AUTH_HASH_ITERATIONS", "200
 auth_scheme = HTTPBearer(auto_error=False)
 
 
+class CustomExpressionGate(Gate):
+    def __init__(self, name: str, input_names: List[str], expression: str):
+        super().__init__(name, num_inputs=len(input_names))
+        self.input_names = input_names
+        self.expression = expression
+
+    def get_symbol(self) -> str:
+        return self.name
+
+    def compute(self) -> Optional[bool]:
+        if None in self.inputs:
+            return None
+
+        normalized = self.expression
+        normalized = normalized.replace("¬", " not ")
+        normalized = normalized.replace("∧", " and ")
+        normalized = normalized.replace("∨", " or ")
+        normalized = normalized.replace("⊕", " != ")
+
+        if normalized == "0 (Always False)":
+            return False
+        if normalized == "1 (Always True)":
+            return True
+
+        context = {
+            name: bool(value)
+            for name, value in zip(self.input_names, self.inputs)
+            if value is not None
+        }
+        context.update({"True": True, "False": False})
+
+        try:
+            evaluated = eval(normalized, {"__builtins__": {}}, context)
+        except Exception as error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid custom gate expression for {self.name}: {error}",
+            ) from error
+
+        return bool(evaluated)
+
+
 def _supabase_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 
 def _supabase_base_url() -> str:
     return f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+
+
+def _supabase_table_url(table_name: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table_name}"
 
 
 def _supabase_headers(prefer: Optional[str] = None) -> Dict[str, str]:
@@ -231,6 +326,446 @@ def _save_users(users: Dict[str, Dict[str, str]]) -> None:
     USERS_FILE.write_text(json.dumps(users, indent=2), encoding="utf-8")
 
 
+def _get_user_profile(username: str) -> Optional[Dict[str, str]]:
+    if _supabase_enabled():
+        try:
+            with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+                response = client.get(
+                    _supabase_table_url(SUPABASE_USERS_TABLE),
+                    params={
+                        "select": "username,salt,password_hash",
+                        "username": f"eq.{username}",
+                        "limit": "1",
+                    },
+                    headers=_supabase_headers(),
+                )
+        except httpx.HTTPError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase user lookup failed: {error}",
+            ) from error
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase user lookup failed: {response.text}",
+            )
+
+        rows = response.json()
+        if not rows:
+            return None
+
+        row = rows[0]
+        if not isinstance(row, dict):
+            return None
+        username_value = row.get("username")
+        salt = row.get("salt")
+        password_hash = row.get("password_hash")
+        if (
+            isinstance(username_value, str)
+            and isinstance(salt, str)
+            and isinstance(password_hash, str)
+        ):
+            return {
+                "username": username_value,
+                "salt": salt,
+                "password_hash": password_hash,
+            }
+        return None
+
+    users = _load_users()
+    profile = users.get(username)
+    if not profile:
+        return None
+    return {
+        "username": username,
+        "salt": profile["salt"],
+        "password_hash": profile["password_hash"],
+    }
+
+
+def _user_exists(username: str) -> bool:
+    return _get_user_profile(username) is not None
+
+
+def _ensure_custom_gates_file() -> None:
+    CUSTOM_GATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not CUSTOM_GATES_FILE.exists():
+        CUSTOM_GATES_FILE.write_text("{}", encoding="utf-8")
+
+
+def _ensure_public_custom_gates_file() -> None:
+    PUBLIC_CUSTOM_GATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not PUBLIC_CUSTOM_GATES_FILE.exists():
+        PUBLIC_CUSTOM_GATES_FILE.write_text("{}", encoding="utf-8")
+
+
+def _load_custom_gate_store() -> Dict[str, Dict[str, Dict[str, object]]]:
+    _ensure_custom_gates_file()
+    try:
+        raw = CUSTOM_GATES_FILE.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Custom gate store is invalid",
+        ) from error
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail="Custom gate store is invalid")
+    return cast(Dict[str, Dict[str, Dict[str, object]]], parsed)
+
+
+def _save_custom_gate_store(store: Dict[str, Dict[str, Dict[str, object]]]) -> None:
+    _ensure_custom_gates_file()
+    CUSTOM_GATES_FILE.write_text(json.dumps(store, indent=2), encoding="utf-8")
+
+
+def _load_public_custom_gate_store() -> Dict[str, Dict[str, object]]:
+    _ensure_public_custom_gates_file()
+    try:
+        raw = PUBLIC_CUSTOM_GATES_FILE.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Public custom gate store is invalid",
+        ) from error
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=500,
+            detail="Public custom gate store is invalid",
+        )
+
+    return cast(Dict[str, Dict[str, object]], parsed)
+
+
+def _save_public_custom_gate_store(store: Dict[str, Dict[str, object]]) -> None:
+    _ensure_public_custom_gates_file()
+    PUBLIC_CUSTOM_GATES_FILE.write_text(json.dumps(store, indent=2), encoding="utf-8")
+
+
+def _validate_symbol_name(name: str, label: str) -> str:
+    normalized = name.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{label} cannot be empty")
+    if not VALID_SYMBOL.fullmatch(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must match [A-Za-z_][A-Za-z0-9_]*",
+        )
+    return normalized
+
+
+def _list_custom_gates_for_user(username: str) -> List[CustomGateDefinition]:
+    if _supabase_enabled():
+        try:
+            with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+                response = client.get(
+                    _supabase_table_url(SUPABASE_CUSTOM_GATES_TABLE),
+                    params={
+                        "select": "name,input_names,expression",
+                        "username": f"eq.{username}",
+                        "order": "name.asc",
+                    },
+                    headers=_supabase_headers(),
+                )
+        except httpx.HTTPError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase custom gate list failed: {error}",
+            ) from error
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase custom gate list failed: {response.text}",
+            )
+
+        gates: List[CustomGateDefinition] = []
+        for row in response.json():
+            if not isinstance(row, dict):
+                continue
+            gate_name = row.get("name")
+            expression = row.get("expression")
+            input_names = row.get("input_names")
+            if (
+                isinstance(gate_name, str)
+                and isinstance(expression, str)
+                and isinstance(input_names, list)
+                and all(isinstance(item, str) for item in input_names)
+            ):
+                gates.append(
+                    CustomGateDefinition(
+                        name=gate_name,
+                        input_names=[item for item in input_names if item.strip()],
+                        expression=expression,
+                    )
+                )
+        return gates
+
+    store = _load_custom_gate_store()
+    user_gates = store.get(username, {})
+    gates: List[CustomGateDefinition] = []
+
+    for gate_name in sorted(user_gates.keys()):
+        gate_def = user_gates[gate_name]
+        input_names = gate_def.get("input_names")
+        expression = gate_def.get("expression")
+        if not isinstance(input_names, list) or not isinstance(expression, str):
+            continue
+        safe_input_names = [
+            item for item in input_names if isinstance(item, str) and item.strip()
+        ]
+        gates.append(
+            CustomGateDefinition(
+                name=gate_name,
+                input_names=safe_input_names,
+                expression=expression,
+            )
+        )
+
+    return gates
+
+
+def _get_custom_gate_for_user(
+    username: str, gate_name: str
+) -> Optional[CustomGateDefinition]:
+    safe_gate_name = _validate_symbol_name(gate_name, "Custom gate name")
+
+    if _supabase_enabled():
+        try:
+            with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+                response = client.get(
+                    _supabase_table_url(SUPABASE_CUSTOM_GATES_TABLE),
+                    params={
+                        "select": "name,input_names,expression",
+                        "username": f"eq.{username}",
+                        "name": f"eq.{safe_gate_name}",
+                        "limit": "1",
+                    },
+                    headers=_supabase_headers(),
+                )
+        except httpx.HTTPError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase custom gate lookup failed: {error}",
+            ) from error
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase custom gate lookup failed: {response.text}",
+            )
+
+        rows = response.json()
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, dict):
+            return None
+        input_names = row.get("input_names")
+        expression = row.get("expression")
+        if not isinstance(input_names, list) or not isinstance(expression, str):
+            return None
+        if not all(isinstance(item, str) for item in input_names):
+            return None
+        return CustomGateDefinition(
+            name=safe_gate_name,
+            input_names=[item for item in input_names if item.strip()],
+            expression=expression,
+        )
+
+    gates = _list_custom_gates_for_user(username)
+    for gate in gates:
+        if gate.name == safe_gate_name:
+            return gate
+    return None
+
+
+def _save_custom_gate_for_user(
+    username: str,
+    gate: CustomGateDefinition,
+    *,
+    overwrite: bool,
+) -> None:
+    if _supabase_enabled():
+        params = {"on_conflict": "username,name"} if overwrite else None
+        prefer = (
+            "resolution=merge-duplicates,return=minimal"
+            if overwrite
+            else "return=minimal"
+        )
+        payload = [
+            {
+                "username": username,
+                "name": gate.name,
+                "input_names": gate.input_names,
+                "expression": gate.expression,
+            }
+        ]
+        try:
+            with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    _supabase_table_url(SUPABASE_CUSTOM_GATES_TABLE),
+                    params=params,
+                    headers=_supabase_headers(prefer=prefer),
+                    json=payload,
+                )
+        except httpx.HTTPError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase custom gate save failed: {error}",
+            ) from error
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase custom gate save failed: {response.text}",
+            )
+        return
+
+    store = _load_custom_gate_store()
+    user_gates = store.get(username, {})
+    if not overwrite and gate.name in user_gates:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Custom gate '{gate.name}' already exists",
+        )
+
+    user_gates[gate.name] = {
+        "input_names": gate.input_names,
+        "expression": gate.expression,
+    }
+    store[username] = user_gates
+    _save_custom_gate_store(store)
+
+
+def _new_custom_gate_share_id() -> str:
+    return f"sg_{secrets.token_hex(6)}"
+
+
+def _get_shared_custom_gate(share_id: str) -> CustomGateDefinition:
+    safe_share_id = _validate_circuit_name(share_id)
+
+    if _supabase_enabled():
+        try:
+            with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+                response = client.get(
+                    _supabase_table_url(SUPABASE_PUBLIC_CUSTOM_GATES_TABLE),
+                    params={
+                        "select": "name,input_names,expression",
+                        "share_id": f"eq.{safe_share_id}",
+                        "limit": "1",
+                    },
+                    headers=_supabase_headers(),
+                )
+        except httpx.HTTPError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase shared custom gate lookup failed: {error}",
+            ) from error
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase shared custom gate lookup failed: {response.text}",
+            )
+
+        rows = response.json()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Shared custom gate not found")
+
+        row = rows[0]
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=500, detail="Shared custom gate is invalid")
+
+        gate_name = row.get("name")
+        input_names = row.get("input_names")
+        expression = row.get("expression")
+        if (
+            not isinstance(gate_name, str)
+            or not isinstance(expression, str)
+            or not isinstance(input_names, list)
+            or not all(isinstance(item, str) and item.strip() for item in input_names)
+        ):
+            raise HTTPException(status_code=500, detail="Shared custom gate is invalid")
+
+        return CustomGateDefinition(
+            name=gate_name,
+            input_names=[item for item in input_names if isinstance(item, str)],
+            expression=expression,
+        )
+
+    store = _load_public_custom_gate_store()
+    entry = store.get(safe_share_id)
+    if not isinstance(entry, dict):
+        raise HTTPException(status_code=404, detail="Shared custom gate not found")
+
+    gate_name = entry.get("name")
+    input_names = entry.get("input_names")
+    expression = entry.get("expression")
+    if not isinstance(gate_name, str) or not isinstance(expression, str):
+        raise HTTPException(status_code=500, detail="Shared custom gate is invalid")
+    if not isinstance(input_names, list) or not all(
+        isinstance(item, str) and item.strip() for item in input_names
+    ):
+        raise HTTPException(status_code=500, detail="Shared custom gate is invalid")
+
+    return CustomGateDefinition(
+        name=gate_name,
+        input_names=[item for item in input_names if isinstance(item, str)],
+        expression=expression,
+    )
+
+
+def _save_shared_custom_gate(
+    share_id: str,
+    gate: CustomGateDefinition,
+    owner: str,
+) -> None:
+    safe_share_id = _validate_circuit_name(share_id)
+    if _supabase_enabled():
+        payload = [
+            {
+                "share_id": safe_share_id,
+                "name": gate.name,
+                "input_names": gate.input_names,
+                "expression": gate.expression,
+                "owner": owner,
+            }
+        ]
+        try:
+            with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    _supabase_table_url(SUPABASE_PUBLIC_CUSTOM_GATES_TABLE),
+                    headers=_supabase_headers(prefer="return=minimal"),
+                    json=payload,
+                )
+        except httpx.HTTPError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase shared custom gate save failed: {error}",
+            ) from error
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase shared custom gate save failed: {response.text}",
+            )
+        return
+
+    store = _load_public_custom_gate_store()
+    store[safe_share_id] = {
+        "name": gate.name,
+        "input_names": gate.input_names,
+        "expression": gate.expression,
+        "owner": owner,
+    }
+    _save_public_custom_gate_store(store)
+
+
 def _validate_username(username: str) -> str:
     normalized = username.strip().lower()
     if not normalized:
@@ -264,22 +799,51 @@ def _hash_password(password: str, salt: str) -> str:
 def _create_user(username: str, password: str) -> None:
     normalized = _validate_username(username)
     secret = _validate_password(password)
-    users = _load_users()
-    if normalized in users:
+    if _user_exists(normalized):
         raise HTTPException(status_code=409, detail="Username already exists")
 
     salt = secrets.token_hex(16)
+    password_hash = _hash_password(secret, salt)
+
+    if _supabase_enabled():
+        payload = [
+            {
+                "username": normalized,
+                "salt": salt,
+                "password_hash": password_hash,
+            }
+        ]
+        try:
+            with httpx.Client(timeout=SUPABASE_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    _supabase_table_url(SUPABASE_USERS_TABLE),
+                    headers=_supabase_headers(prefer="return=minimal"),
+                    json=payload,
+                )
+        except httpx.HTTPError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase user create failed: {error}",
+            ) from error
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase user create failed: {response.text}",
+            )
+        return
+
+    users = _load_users()
     users[normalized] = {
         "salt": salt,
-        "password_hash": _hash_password(secret, salt),
+        "password_hash": password_hash,
     }
     _save_users(users)
 
 
 def _verify_user_credentials(username: str, password: str) -> bool:
     normalized = _validate_username(username)
-    users = _load_users()
-    profile = users.get(normalized)
+    profile = _get_user_profile(normalized)
     if not profile:
         return False
 
@@ -339,8 +903,7 @@ def _verify_auth_token(token: str) -> str:
     if exp < int(time.time()):
         raise HTTPException(status_code=401, detail="Token expired")
 
-    users = _load_users()
-    if username not in users:
+    if not _user_exists(username):
         raise HTTPException(status_code=401, detail="Invalid auth token")
     return username
 
@@ -350,6 +913,14 @@ def _require_authenticated_user(
 ) -> str:
     if credentials is None:
         raise HTTPException(status_code=401, detail="Authentication required")
+    return _verify_auth_token(credentials.credentials)
+
+
+def _resolve_optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(auth_scheme),
+) -> Optional[str]:
+    if credentials is None:
+        return None
     return _verify_auth_token(credentials.credentials)
 
 
@@ -563,6 +1134,7 @@ def _load_public_circuit_supabase(share_id: str) -> Dict[str, object]:
 
 def _build_circuit(
     payload: CircuitPayload,
+    username: Optional[str] = None,
 ) -> Tuple[Circuit, Dict[str, Gate], Dict[str, InputNode], Dict[str, OutputNode]]:
     circuit = Circuit()
     gates_by_id: Dict[str, Gate] = {}
@@ -582,9 +1154,33 @@ def _build_circuit(
         outputs_by_id[output_spec.id] = node
 
     for gate_spec in payload.gates:
-        gate_class = GATE_CLASSES[gate_spec.type]
         gate_name = gate_spec.name or gate_spec.id.upper()
-        gate = gate_class(gate_name)
+        if gate_spec.type in GATE_CLASSES:
+            gate_class = GATE_CLASSES[gate_spec.type]
+            gate = gate_class(gate_name)
+        elif gate_spec.type.startswith("custom:"):
+            if not username:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Custom gates require authentication",
+                )
+            custom_name = gate_spec.type.split(":", 1)[1]
+            gate_def = _get_custom_gate_for_user(username, custom_name)
+            if gate_def is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown custom gate: {custom_name}",
+                )
+            gate = CustomExpressionGate(
+                gate_name,
+                gate_def.input_names,
+                gate_def.expression,
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported gate type: {gate_spec.type}",
+            )
         gate.move_to(gate_spec.x, gate_spec.y)
         circuit.add_gate(gate)
         gates_by_id[gate_spec.id] = gate
@@ -671,7 +1267,126 @@ def storage_info() -> Dict[str, str]:
     return {
         "mode": "supabase" if _supabase_enabled() else "filesystem",
         "table": SUPABASE_TABLE if _supabase_enabled() else "data/circuits",
+        "auth_store": (
+            SUPABASE_USERS_TABLE if _supabase_enabled() else "data/users.json"
+        ),
+        "custom_gate_store": (
+            SUPABASE_CUSTOM_GATES_TABLE
+            if _supabase_enabled()
+            else "data/custom_gates.json"
+        ),
+        "public_custom_gate_store": (
+            SUPABASE_PUBLIC_CUSTOM_GATES_TABLE
+            if _supabase_enabled()
+            else "data/public_custom_gates.json"
+        ),
     }
+
+
+@app.get("/api/custom-gates", response_model=CustomGateListResponse)
+def list_custom_gates(
+    username: str = Depends(_require_authenticated_user),
+) -> CustomGateListResponse:
+    return CustomGateListResponse(gates=_list_custom_gates_for_user(username))
+
+
+@app.post("/api/custom-gates/create", response_model=CustomGateDefinition)
+def create_custom_gate(
+    request: CreateCustomGateRequest,
+    username: str = Depends(_require_authenticated_user),
+) -> CustomGateDefinition:
+    gate_name = _validate_symbol_name(request.name.lower(), "Custom gate name")
+    circuit, _, _, _ = _build_circuit(request.circuit, username=username)
+    engine = SimulationEngine(circuit)
+    expressions = engine.get_boolean_expression()
+
+    if not expressions:
+        raise HTTPException(
+            status_code=400,
+            detail="Circuit must include inputs and at least one output",
+        )
+
+    output_name = request.output_name or next(iter(expressions.keys()))
+    if output_name not in expressions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Output '{output_name}' not found in expression results",
+        )
+
+    input_names = [
+        _validate_symbol_name(node.name, "Input name")
+        for node in request.circuit.inputs
+    ]
+    if not input_names:
+        raise HTTPException(
+            status_code=400,
+            detail="Custom gate circuit must include at least one input",
+        )
+
+    gate_definition = CustomGateDefinition(
+        name=gate_name,
+        input_names=input_names,
+        expression=expressions[output_name],
+    )
+    _save_custom_gate_for_user(username, gate_definition, overwrite=True)
+
+    return gate_definition
+
+
+@app.post("/api/custom-gates/share/{name}", response_model=ShareCustomGateResponse)
+def share_custom_gate(
+    name: str,
+    username: str = Depends(_require_authenticated_user),
+) -> ShareCustomGateResponse:
+    safe_gate_name = _validate_symbol_name(name.lower(), "Custom gate name")
+    gate = _get_custom_gate_for_user(username, safe_gate_name)
+    if gate is None:
+        raise HTTPException(
+            status_code=404, detail=f"Custom gate '{safe_gate_name}' not found"
+        )
+
+    share_id = _new_custom_gate_share_id()
+    _save_shared_custom_gate(share_id, gate, username)
+
+    return ShareCustomGateResponse(
+        share_id=share_id,
+        share_path=f"/?gateShare={share_id}",
+        gate=gate,
+    )
+
+
+@app.get("/api/public/custom-gates/{share_id}", response_model=CustomGateDefinition)
+def get_public_shared_custom_gate(share_id: str) -> CustomGateDefinition:
+    return _get_shared_custom_gate(share_id)
+
+
+@app.post("/api/custom-gates/import/{share_id}", response_model=CustomGateDefinition)
+def import_shared_custom_gate(
+    share_id: str,
+    request: ImportCustomGateRequest,
+    username: str = Depends(_require_authenticated_user),
+) -> CustomGateDefinition:
+    shared_gate = _get_shared_custom_gate(share_id)
+    target_name = (
+        _validate_symbol_name(request.name.lower(), "Custom gate name")
+        if request.name
+        else shared_gate.name
+    )
+
+    if _get_custom_gate_for_user(username, target_name) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Custom gate '{target_name}' already exists",
+        )
+
+    imported_gate = CustomGateDefinition(
+        name=target_name,
+        input_names=shared_gate.input_names,
+        expression=shared_gate.expression,
+    )
+    _save_custom_gate_for_user(username, imported_gate, overwrite=False)
+
+    return imported_gate
 
 
 @app.get("/api/circuit/list", response_model=CircuitListResponse)
@@ -822,8 +1537,14 @@ def evaluate_gate(request: GateEvaluateRequest) -> Dict[str, Optional[bool]]:
 
 
 @app.post("/api/circuit/simulate", response_model=SimulationResponse)
-def simulate_circuit(request: SimulationRequest) -> SimulationResponse:
-    circuit, gates_by_id, _, outputs_by_id = _build_circuit(request.circuit)
+def simulate_circuit(
+    request: SimulationRequest,
+    username: Optional[str] = Depends(_resolve_optional_user),
+) -> SimulationResponse:
+    circuit, gates_by_id, _, outputs_by_id = _build_circuit(
+        request.circuit,
+        username=username,
+    )
     engine = SimulationEngine(circuit)
     engine.simulate()
 
@@ -843,6 +1564,29 @@ def simulate_circuit(request: SimulationRequest) -> SimulationResponse:
         ),
         expressions=expressions,
     )
+
+
+@app.post("/api/circuit/timing", response_model=TimingResponse)
+def timing_diagram(
+    request: SimulationRequest,
+    username: Optional[str] = Depends(_resolve_optional_user),
+) -> TimingResponse:
+    circuit, _, _, _ = _build_circuit(request.circuit, username=username)
+    engine = SimulationEngine(circuit)
+    input_names, output_names, rows = engine.generate_truth_table()
+
+    if not rows:
+        return TimingResponse(steps=[], signals=[])
+
+    step_count = len(rows)
+    steps = list(range(step_count))
+    signal_names = input_names + output_names
+    signals: List[TimingSignal] = []
+    for signal_index, signal_name in enumerate(signal_names):
+        values = [bool(row[signal_index]) for row in rows]
+        signals.append(TimingSignal(name=signal_name, values=values))
+
+    return TimingResponse(steps=steps, signals=signals)
 
 
 @app.get("/api/circuit/example", response_model=SimulationRequest)

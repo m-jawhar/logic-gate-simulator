@@ -231,6 +231,9 @@ The API supports Supabase-backed persistence for `save/list/load` when these env
 LOGIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
 LOGIC_SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>
 LOGIC_SUPABASE_TABLE=circuits
+LOGIC_SUPABASE_USERS_TABLE=logic_users
+LOGIC_SUPABASE_CUSTOM_GATES_TABLE=custom_gates
+LOGIC_SUPABASE_PUBLIC_CUSTOM_GATES_TABLE=public_custom_gates
 ```
 
 Create the table in Supabase SQL Editor:
@@ -254,12 +257,51 @@ drop trigger if exists trg_touch_circuits_updated_at on public.circuits;
 create trigger trg_touch_circuits_updated_at
 before update on public.circuits
 for each row execute procedure public.touch_circuits_updated_at();
+
+create table if not exists public.logic_users (
+   username text primary key,
+   salt text not null,
+   password_hash text not null,
+   created_at timestamptz not null default now()
+);
+
+create table if not exists public.custom_gates (
+   username text not null,
+   name text not null,
+   input_names jsonb not null,
+   expression text not null,
+   created_at timestamptz not null default now(),
+   updated_at timestamptz not null default now(),
+   primary key (username, name)
+);
+
+create table if not exists public.public_custom_gates (
+   share_id text primary key,
+   name text not null,
+   input_names jsonb not null,
+   expression text not null,
+   owner text not null,
+   created_at timestamptz not null default now()
+);
+
+create or replace function public.touch_custom_gates_updated_at()
+returns trigger as $$
+begin
+   new.updated_at = now();
+   return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_touch_custom_gates_updated_at on public.custom_gates;
+create trigger trg_touch_custom_gates_updated_at
+before update on public.custom_gates
+for each row execute procedure public.touch_custom_gates_updated_at();
 ```
 
 Notes:
 
 - Use the **service role key** only on the backend (never expose in frontend).
-- If Supabase vars are not set, the API automatically falls back to local file storage.
+- If Supabase vars are not set, the API automatically falls back to local file storage for circuits, auth users, custom gates, and shared custom gates.
 
 ## 📖 How to Use
 

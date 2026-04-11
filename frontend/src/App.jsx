@@ -83,6 +83,21 @@ function formatTruthTable(table) {
   return `${header}\n${separator}\n${body}`;
 }
 
+function formatTimingDiagram(timing) {
+  if (!timing?.steps?.length || !timing?.signals?.length) {
+    return "Run timing analysis to generate a timing diagram.";
+  }
+
+  const stepLine = `Step: ${timing.steps.map((step) => String(step)).join(" ")}`;
+  const signalLines = timing.signals.map((signal) => {
+    const waveform = signal.values
+      .map((value) => (value ? "-" : "_"))
+      .join(" ");
+    return `${signal.name.padEnd(10, " ")}: ${waveform}`;
+  });
+  return [stepLine, ...signalLines].join("\n");
+}
+
 function pointerToSvg(svg, clientX, clientY) {
   const point = svg.createSVGPoint();
   point.x = clientX;
@@ -124,6 +139,10 @@ export default function App() {
 
   const [simulateResult, setSimulateResult] = useState(null);
   const [showTruthModal, setShowTruthModal] = useState(false);
+  const [showTimingModal, setShowTimingModal] = useState(false);
+  const [timingDiagramText, setTimingDiagramText] = useState(
+    "Run timing analysis to generate a timing diagram.",
+  );
   const [statusMessage, setStatusMessage] = useState(
     "Ready - Drag components to canvas, click to select, wire mode to connect",
   );
@@ -131,6 +150,11 @@ export default function App() {
   const [circuitName, setCircuitName] = useState("demo_circuit");
   const [savedCircuits, setSavedCircuits] = useState([]);
   const [selectedSavedName, setSelectedSavedName] = useState("");
+  const [customGates, setCustomGates] = useState([]);
+  const [customGateName, setCustomGateName] = useState("my_gate");
+  const [customGateOutput, setCustomGateOutput] = useState("");
+  const [sharedCustomGateLink, setSharedCustomGateLink] = useState("");
+  const [importCustomGateShareId, setImportCustomGateShareId] = useState("");
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [authToken, setAuthToken] = useState(() => {
@@ -175,6 +199,14 @@ export default function App() {
     return map;
   }, [inputs, gates, outputs]);
 
+  const customGateByName = useMemo(() => {
+    const map = new Map();
+    customGates.forEach((gate) => {
+      map.set(gate.name, gate);
+    });
+    return map;
+  }, [customGates]);
+
   function buildCircuitPayload() {
     return {
       circuit: {
@@ -184,6 +216,28 @@ export default function App() {
         wires,
       },
     };
+  }
+
+  function gateInputCount(gateType) {
+    if (Object.prototype.hasOwnProperty.call(GATE_INPUTS, gateType)) {
+      return GATE_INPUTS[gateType];
+    }
+    if (gateType.startsWith("custom:")) {
+      const customName = gateType.split(":", 2)[1];
+      const customDef = customGateByName.get(customName);
+      if (customDef?.input_names?.length) {
+        return customDef.input_names.length;
+      }
+    }
+    return 2;
+  }
+
+  function gateDisplaySymbol(gateType) {
+    if (gateType.startsWith("custom:")) {
+      const customName = gateType.split(":", 2)[1];
+      return customName.toUpperCase();
+    }
+    return gateType.toUpperCase();
   }
 
   function getAuthHeaders() {
@@ -355,6 +409,30 @@ export default function App() {
     }
   }
 
+  async function refreshCustomGates(tokenOverride = authToken) {
+    if (!tokenOverride) {
+      setCustomGates([]);
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/custom-gates", {
+        headers: { Authorization: `Bearer ${tokenOverride}` },
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        if (response.status === 401) {
+          setAuthToken("");
+          setAuthUser("");
+        }
+        throw new Error(data.detail || "Could not load custom gates");
+      }
+      setCustomGates(data.gates || []);
+    } catch (error) {
+      setStatusMessage(error.message);
+    }
+  }
+
   useEffect(() => {
     void checkBackend();
   }, []);
@@ -363,10 +441,12 @@ export default function App() {
     if (!authToken) {
       setSavedCircuits([]);
       setSelectedSavedName("");
+      setCustomGates([]);
       return;
     }
 
     void refreshSavedCircuits();
+    void refreshCustomGates();
   }, [authToken]);
 
   useEffect(() => {
@@ -402,6 +482,50 @@ export default function App() {
 
     void loadSharedCircuit();
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !authToken) {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const gateShare = params.get("gateShare");
+    if (!gateShare) {
+      return;
+    }
+
+    async function autoImportSharedGate() {
+      try {
+        const response = await fetch(
+          `/api/custom-gates/import/${encodeURIComponent(gateShare)}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...getAuthHeaders(),
+            },
+            body: JSON.stringify({}),
+          },
+        );
+        const data = await response.json();
+        if (!response.ok) {
+          // If already imported, leave it silent to avoid noisy status messages on refresh.
+          if (response.status !== 409) {
+            throw new Error(
+              data.detail || "Could not auto-import shared custom gate",
+            );
+          }
+        } else {
+          setStatusMessage(`Imported shared custom gate '${data.name}'.`);
+        }
+        await refreshCustomGates();
+      } catch (error) {
+        setStatusMessage(error.message);
+      }
+    }
+
+    void autoImportSharedGate();
+  }, [authToken]);
 
   useEffect(() => {
     function onResize() {
@@ -523,10 +647,13 @@ export default function App() {
     pushUndoSnapshot();
     gateCounter.current += 1;
     const y = 100 + totalComponentCount() * 80;
+    const baseName = type.startsWith("custom:")
+      ? type.split(":", 2)[1].toUpperCase()
+      : type.toUpperCase();
     const next = {
       id: `g_${gateCounter.current}`,
       type,
-      name: `${type.toUpperCase()}${gateCounter.current}`,
+      name: `${baseName}${gateCounter.current}`,
       x: 250,
       y,
     };
@@ -790,7 +917,10 @@ export default function App() {
     try {
       const response = await fetch("/api/circuit/simulate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeaders(),
+        },
         body: JSON.stringify(buildCircuitPayload()),
       });
       const data = await response.json();
@@ -807,6 +937,29 @@ export default function App() {
         setStatusMessage(error.message);
       }
       return null;
+    }
+  }
+
+  async function openTimingDiagram() {
+    setStatusMessage("Generating timing diagram...");
+    try {
+      const response = await fetch("/api/circuit/timing", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify(buildCircuitPayload()),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Timing analysis failed");
+      }
+      setTimingDiagramText(formatTimingDiagram(data));
+      setShowTimingModal(true);
+      setStatusMessage("Timing diagram ready.");
+    } catch (error) {
+      setStatusMessage(error.message);
     }
   }
 
@@ -951,6 +1104,123 @@ export default function App() {
     }
   }
 
+  async function createCustomGateFromCurrentCircuit() {
+    if (!authToken) {
+      setStatusMessage("Sign in to create custom gates.");
+      return;
+    }
+
+    if (!customGateName.trim()) {
+      setStatusMessage("Provide a custom gate name.");
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/custom-gates/create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({
+          name: customGateName.trim().toLowerCase(),
+          output_name: customGateOutput || undefined,
+          circuit: buildCircuitPayload().circuit,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not create custom gate");
+      }
+
+      setStatusMessage(`Custom gate '${data.name}' created.`);
+      await refreshCustomGates();
+    } catch (error) {
+      setStatusMessage(error.message);
+    }
+  }
+
+  async function shareCustomGate(name) {
+    if (!authToken) {
+      setStatusMessage("Sign in to share custom gates.");
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `/api/custom-gates/share/${encodeURIComponent(name)}`,
+        {
+          method: "POST",
+          headers: getAuthHeaders(),
+        },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not share custom gate");
+      }
+
+      const link = toAbsoluteShareLink(data.share_path);
+      setSharedCustomGateLink(link);
+      setStatusMessage(`Custom gate '${name}' share link created.`);
+    } catch (error) {
+      setStatusMessage(error.message);
+    }
+  }
+
+  async function importSharedCustomGate() {
+    if (!authToken) {
+      setStatusMessage("Sign in to import shared custom gates.");
+      return;
+    }
+
+    const raw = importCustomGateShareId.trim();
+    if (!raw) {
+      setStatusMessage("Provide a shared custom gate ID or link.");
+      return;
+    }
+
+    let shareId = raw;
+    try {
+      if (raw.includes("gateShare=")) {
+        const parsedUrl = new URL(raw);
+        shareId = parsedUrl.searchParams.get("gateShare") || raw;
+      }
+    } catch {
+      if (raw.includes("gateShare=")) {
+        shareId = raw.split("gateShare=")[1].split("&")[0];
+      }
+    }
+
+    if (!shareId) {
+      setStatusMessage("Invalid shared custom gate link.");
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `/api/custom-gates/import/${encodeURIComponent(shareId)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...getAuthHeaders(),
+          },
+          body: JSON.stringify({}),
+        },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not import shared custom gate");
+      }
+
+      setStatusMessage(`Imported custom gate '${data.name}'.`);
+      setImportCustomGateShareId("");
+      await refreshCustomGates();
+    } catch (error) {
+      setStatusMessage(error.message);
+    }
+  }
+
   async function submitAuth(path) {
     const username = authUsername.trim().toLowerCase();
     if (!username || !authPassword) {
@@ -1009,9 +1279,9 @@ export default function App() {
     if (selectedNode.kind === "gate") {
       const gateOutput = simulateResult?.gate_outputs?.[node.id];
       return [
-        `Gate: ${node.type.toUpperCase()}`,
+        `Gate: ${gateDisplaySymbol(node.type)}`,
         `Name: ${node.name}`,
-        `Inputs: ${GATE_INPUTS[node.type] || 2}`,
+        `Inputs: ${gateInputCount(node.type)}`,
         `Output: ${boolToBit(gateOutput)}`,
         `Position: (${Math.round(node.x)}, ${Math.round(node.y)})`,
       ].join("\n");
@@ -1194,6 +1464,25 @@ export default function App() {
             <button onClick={() => addGate("nor")}>NOR Gate</button>
             <button onClick={() => addGate("xor")}>XOR Gate</button>
 
+            {customGates.length ? (
+              <>
+                <h4>Custom Gates</h4>
+                {customGates.map((gate) => (
+                  <div key={gate.name}>
+                    <button onClick={() => addGate(`custom:${gate.name}`)}>
+                      {gate.name.toUpperCase()} ({gate.input_names.length} in)
+                    </button>
+                    <button
+                      onClick={() => shareCustomGate(gate.name)}
+                      disabled={!authToken}
+                    >
+                      Share {gate.name}
+                    </button>
+                  </div>
+                ))}
+              </>
+            ) : null}
+
             <hr />
 
             <h4>Actions</h4>
@@ -1213,6 +1502,7 @@ export default function App() {
 
             <button onClick={() => void simulateCircuit(true)}>Simulate</button>
             <button onClick={openTruthTable}>Truth Table</button>
+            <button onClick={openTimingDiagram}>Timing Diagram</button>
 
             <hr />
 
@@ -1307,6 +1597,86 @@ export default function App() {
             />
             <button onClick={copySharedLink} disabled={!sharedLink}>
               Copy Share Link
+            </button>
+
+            <hr />
+
+            <h4>Custom Gate Builder</h4>
+            <label className="mini-label" htmlFor="customGateName">
+              Custom Gate Name
+            </label>
+            <input
+              id="customGateName"
+              value={customGateName}
+              onChange={(event) => setCustomGateName(event.target.value)}
+              disabled={!authToken}
+            />
+
+            <label className="mini-label" htmlFor="customGateOutput">
+              Source Output
+            </label>
+            <select
+              id="customGateOutput"
+              value={customGateOutput}
+              onChange={(event) => setCustomGateOutput(event.target.value)}
+              disabled={!authToken || !outputs.length}
+            >
+              <option value="">First output (default)</option>
+              {outputs.map((node) => (
+                <option key={node.id} value={node.name}>
+                  {node.name}
+                </option>
+              ))}
+            </select>
+
+            <button
+              onClick={createCustomGateFromCurrentCircuit}
+              disabled={!authToken || !inputs.length || !outputs.length}
+            >
+              Create Custom Gate
+            </button>
+
+            <label className="mini-label" htmlFor="sharedCustomGateLink">
+              Shared Custom Gate Link
+            </label>
+            <input
+              id="sharedCustomGateLink"
+              value={sharedCustomGateLink}
+              readOnly
+              placeholder="(none)"
+            />
+            <button
+              onClick={async () => {
+                if (!sharedCustomGateLink) {
+                  setStatusMessage("No shared custom gate link available.");
+                  return;
+                }
+                if (navigator?.clipboard?.writeText) {
+                  await navigator.clipboard.writeText(sharedCustomGateLink);
+                  setStatusMessage("Shared custom gate link copied.");
+                } else {
+                  setStatusMessage("Clipboard API unavailable. Copy manually.");
+                }
+              }}
+              disabled={!sharedCustomGateLink}
+            >
+              Copy Shared Custom Gate Link
+            </button>
+
+            <label className="mini-label" htmlFor="importCustomGateShareId">
+              Import Shared Custom Gate
+            </label>
+            <input
+              id="importCustomGateShareId"
+              value={importCustomGateShareId}
+              onChange={(event) =>
+                setImportCustomGateShareId(event.target.value)
+              }
+              placeholder="share id or ?gateShare= link"
+              disabled={!authToken}
+            />
+            <button onClick={importSharedCustomGate} disabled={!authToken}>
+              Import Shared Gate
             </button>
           </div>
         </aside>
@@ -1470,13 +1840,13 @@ export default function App() {
                       y={center.y + 4}
                       textAnchor="middle"
                       fill={COLORS.gateText}
-                      fontSize="24"
+                      fontSize={node.type.startsWith("custom:") ? "13" : "24"}
                       fontWeight="700"
                     >
-                      {node.type.toUpperCase()}
+                      {gateDisplaySymbol(node.type)}
                     </text>
 
-                    {Array.from({ length: GATE_INPUTS[node.type] || 2 }).map(
+                    {Array.from({ length: gateInputCount(node.type) }).map(
                       (_, idx) => {
                         const pos = getInputPort(node, "gate", idx);
                         return (
@@ -1670,6 +2040,18 @@ export default function App() {
             <pre className="truth-modal-pre">
               {formatTruthTable(simulateResult?.truth_table)}
             </pre>
+          </div>
+        </div>
+      ) : null}
+
+      {showTimingModal ? (
+        <div className="modal-overlay">
+          <div className="modal-card">
+            <div className="modal-header">
+              <h3>Timing Diagram</h3>
+              <button onClick={() => setShowTimingModal(false)}>Close</button>
+            </div>
+            <pre className="truth-modal-pre">{timingDiagramText}</pre>
           </div>
         </div>
       ) : null}

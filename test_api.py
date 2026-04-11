@@ -219,6 +219,262 @@ class TestLogicApi(unittest.TestCase):
             public_load_response.json()["circuit"]["inputs"][0]["name"], "A"
         )
 
+    def test_timing_diagram_endpoint(self):
+        payload = {
+            "circuit": {
+                "inputs": [
+                    {"id": "in_a", "name": "A", "value": False},
+                    {"id": "in_b", "name": "B", "value": False},
+                ],
+                "outputs": [{"id": "out_y", "name": "Y"}],
+                "gates": [{"id": "g1", "type": "or", "name": "OR1"}],
+                "wires": [
+                    {
+                        "source_id": "in_a",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 0,
+                    },
+                    {
+                        "source_id": "in_b",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 1,
+                    },
+                    {
+                        "source_id": "g1",
+                        "source_type": "gate",
+                        "target_id": "out_y",
+                        "target_type": "output",
+                        "target_input_index": 0,
+                    },
+                ],
+            }
+        }
+
+        response = self.client.post("/api/circuit/timing", json=payload)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("steps", body)
+        self.assertIn("signals", body)
+        self.assertGreaterEqual(len(body["steps"]), 1)
+
+    def test_create_and_use_custom_gate(self):
+        create_payload = {
+            "name": "my_and",
+            "output_name": "Y",
+            "circuit": {
+                "inputs": [
+                    {"id": "in_a", "name": "A", "value": False},
+                    {"id": "in_b", "name": "B", "value": False},
+                ],
+                "outputs": [{"id": "out_y", "name": "Y"}],
+                "gates": [{"id": "g1", "type": "and", "name": "AND1"}],
+                "wires": [
+                    {
+                        "source_id": "in_a",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 0,
+                    },
+                    {
+                        "source_id": "in_b",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 1,
+                    },
+                    {
+                        "source_id": "g1",
+                        "source_type": "gate",
+                        "target_id": "out_y",
+                        "target_type": "output",
+                        "target_input_index": 0,
+                    },
+                ],
+            },
+        }
+
+        create_response = self.client.post(
+            "/api/custom-gates/create",
+            json=create_payload,
+            headers=self.auth_headers,
+        )
+        self.assertEqual(create_response.status_code, 200)
+
+        list_response = self.client.get("/api/custom-gates", headers=self.auth_headers)
+        self.assertEqual(list_response.status_code, 200)
+        self.assertTrue(
+            any(g["name"] == "my_and" for g in list_response.json()["gates"])
+        )
+
+        simulate_payload = {
+            "circuit": {
+                "inputs": [
+                    {"id": "in_a", "name": "A", "value": True},
+                    {"id": "in_b", "name": "B", "value": True},
+                ],
+                "outputs": [{"id": "out_y", "name": "Y"}],
+                "gates": [
+                    {"id": "g_custom", "type": "custom:my_and", "name": "MYAND1"}
+                ],
+                "wires": [
+                    {
+                        "source_id": "in_a",
+                        "source_type": "input",
+                        "target_id": "g_custom",
+                        "target_type": "gate",
+                        "target_input_index": 0,
+                    },
+                    {
+                        "source_id": "in_b",
+                        "source_type": "input",
+                        "target_id": "g_custom",
+                        "target_type": "gate",
+                        "target_input_index": 1,
+                    },
+                    {
+                        "source_id": "g_custom",
+                        "source_type": "gate",
+                        "target_id": "out_y",
+                        "target_type": "output",
+                        "target_input_index": 0,
+                    },
+                ],
+            }
+        }
+
+        simulate_response = self.client.post(
+            "/api/circuit/simulate",
+            json=simulate_payload,
+            headers=self.auth_headers,
+        )
+        self.assertEqual(simulate_response.status_code, 200)
+        self.assertEqual(simulate_response.json()["output_values"]["out_y"], True)
+
+    def test_share_and_import_custom_gate_between_users(self):
+        create_payload = {
+            "name": "shared_and",
+            "output_name": "Y",
+            "circuit": {
+                "inputs": [
+                    {"id": "in_a", "name": "A", "value": False},
+                    {"id": "in_b", "name": "B", "value": False},
+                ],
+                "outputs": [{"id": "out_y", "name": "Y"}],
+                "gates": [{"id": "g1", "type": "and", "name": "AND1"}],
+                "wires": [
+                    {
+                        "source_id": "in_a",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 0,
+                    },
+                    {
+                        "source_id": "in_b",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 1,
+                    },
+                    {
+                        "source_id": "g1",
+                        "source_type": "gate",
+                        "target_id": "out_y",
+                        "target_type": "output",
+                        "target_input_index": 0,
+                    },
+                ],
+            },
+        }
+
+        create_response = self.client.post(
+            "/api/custom-gates/create",
+            json=create_payload,
+            headers=self.auth_headers,
+        )
+        self.assertEqual(create_response.status_code, 200)
+
+        share_response = self.client.post(
+            "/api/custom-gates/share/shared_and",
+            headers=self.auth_headers,
+        )
+        self.assertEqual(share_response.status_code, 200)
+        share_id = share_response.json()["share_id"]
+
+        public_response = self.client.get(f"/api/public/custom-gates/{share_id}")
+        self.assertEqual(public_response.status_code, 200)
+        self.assertEqual(public_response.json()["name"], "shared_and")
+
+        other_username = f"user_{uuid.uuid4().hex[:8]}"
+        other_password = "password123"
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={"username": other_username, "password": other_password},
+        )
+        self.assertEqual(register_response.status_code, 200)
+        other_token = register_response.json()["access_token"]
+        other_headers = {"Authorization": f"Bearer {other_token}"}
+
+        import_response = self.client.post(
+            f"/api/custom-gates/import/{share_id}",
+            json={},
+            headers=other_headers,
+        )
+        self.assertEqual(import_response.status_code, 200)
+
+        simulate_payload = {
+            "circuit": {
+                "inputs": [
+                    {"id": "in_a", "name": "A", "value": True},
+                    {"id": "in_b", "name": "B", "value": True},
+                ],
+                "outputs": [{"id": "out_y", "name": "Y"}],
+                "gates": [
+                    {
+                        "id": "g_custom",
+                        "type": "custom:shared_and",
+                        "name": "SHAREDAND1",
+                    }
+                ],
+                "wires": [
+                    {
+                        "source_id": "in_a",
+                        "source_type": "input",
+                        "target_id": "g_custom",
+                        "target_type": "gate",
+                        "target_input_index": 0,
+                    },
+                    {
+                        "source_id": "in_b",
+                        "source_type": "input",
+                        "target_id": "g_custom",
+                        "target_type": "gate",
+                        "target_input_index": 1,
+                    },
+                    {
+                        "source_id": "g_custom",
+                        "source_type": "gate",
+                        "target_id": "out_y",
+                        "target_type": "output",
+                        "target_input_index": 0,
+                    },
+                ],
+            }
+        }
+
+        simulate_response = self.client.post(
+            "/api/circuit/simulate",
+            json=simulate_payload,
+            headers=other_headers,
+        )
+        self.assertEqual(simulate_response.status_code, 200)
+        self.assertEqual(simulate_response.json()["output_values"]["out_y"], True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

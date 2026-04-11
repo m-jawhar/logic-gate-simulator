@@ -35,3 +35,5 @@ htmlcov/
 data/users.json
 data/circuits/user_*/
 data/public_circuits/*.json
+data/custom_gates.json
+data/public_custom_gates.json
