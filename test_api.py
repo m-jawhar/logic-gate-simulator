@@ -87,6 +87,44 @@ class TestLogicApi(unittest.TestCase):
         self.assertIn("truth_table", body)
         self.assertIn("expressions", body)
 
+    def test_simulate_partially_connected_circuit_returns_nullable_truth_rows(self):
+        payload = {
+            "circuit": {
+                "inputs": [
+                    {"id": "in_a", "name": "A", "value": False},
+                    {"id": "in_b", "name": "B", "value": False},
+                ],
+                "outputs": [{"id": "out_y", "name": "Y"}],
+                "gates": [{"id": "g1", "type": "and", "name": "AND1"}],
+                "wires": [
+                    {
+                        "source_id": "in_a",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 0,
+                    },
+                    {
+                        "source_id": "in_b",
+                        "source_type": "input",
+                        "target_id": "g1",
+                        "target_type": "gate",
+                        "target_input_index": 1,
+                    },
+                ],
+            }
+        }
+
+        response = self.client.post("/api/circuit/simulate", json=payload)
+        self.assertEqual(response.status_code, 200)
+
+        body = response.json()
+        self.assertIsNone(body["output_values"]["out_y"])
+        rows = body["truth_table"]["rows"]
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            self.assertIsNone(row[2])
+
     def test_simulate_invalid_gate_input_index(self):
         payload = {
             "circuit": {

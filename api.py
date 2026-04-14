@@ -105,7 +105,7 @@ class GateEvaluateRequest(BaseModel):
 class TruthTableResponse(BaseModel):
     input_names: List[str]
     output_names: List[str]
-    rows: List[List[bool]]
+    rows: List[List[Optional[bool]]]
 
 
 class SimulationResponse(BaseModel):
@@ -117,7 +117,7 @@ class SimulationResponse(BaseModel):
 
 class TimingSignal(BaseModel):
     name: str
-    values: List[bool]
+    values: List[Optional[bool]]
 
 
 class TimingResponse(BaseModel):
@@ -1583,7 +1583,7 @@ def timing_diagram(
     signal_names = input_names + output_names
     signals: List[TimingSignal] = []
     for signal_index, signal_name in enumerate(signal_names):
-        values = [bool(row[signal_index]) for row in rows]
+        values = [row[signal_index] for row in rows]
         signals.append(TimingSignal(name=signal_name, values=values))
 
     return TimingResponse(steps=steps, signals=signals)

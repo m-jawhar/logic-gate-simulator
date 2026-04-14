@@ -78,7 +78,7 @@ function formatTruthTable(table) {
   const header = ` ${columns.join(" | ")} `;
   const separator = "-".repeat(header.length);
   const body = table.rows
-    .map((row) => ` ${row.map((value) => (value ? "1" : "0")).join(" | ")} `)
+    .map((row) => ` ${row.map((value) => boolToBit(value)).join(" | ")} `)
     .join("\n");
   return `${header}\n${separator}\n${body}`;
 }
@@ -91,7 +91,9 @@ function formatTimingDiagram(timing) {
   const stepLine = `Step: ${timing.steps.map((step) => String(step)).join(" ")}`;
   const signalLines = timing.signals.map((signal) => {
     const waveform = signal.values
-      .map((value) => (value ? "-" : "_"))
+      .map((value) =>
+        value === undefined || value === null ? "?" : value ? "-" : "_",
+      )
       .join(" ");
     return `${signal.name.padEnd(10, " ")}: ${waveform}`;
   });

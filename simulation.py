@@ -2,8 +2,9 @@
 Simulation Engine - Handles circuit simulation and truth table generation
 """
 
-from typing import List, Dict, Optional, Tuple
 from itertools import product
+from typing import Dict, List, Optional, Tuple
+
 from gates import Gate, InputNode, OutputNode, Wire
 
 
@@ -126,7 +127,9 @@ class SimulationEngine:
                 connected_inputs += 1
         return connected_inputs == gate.num_inputs
 
-    def generate_truth_table(self) -> Tuple[List[str], List[str], List[List[bool]]]:
+    def generate_truth_table(
+        self,
+    ) -> Tuple[List[str], List[str], List[List[Optional[bool]]]]:
         """
         Generate truth table for the current circuit.
         Returns: (input_names, output_names, rows)
@@ -205,7 +208,7 @@ class SimulationEngine:
 
 
 def format_truth_table(
-    input_names: List[str], output_names: List[str], rows: List[List[bool]]
+    input_names: List[str], output_names: List[str], rows: List[List[Optional[bool]]]
 ) -> str:
     """Format truth table as a string for display"""
     if not rows:
@@ -223,7 +226,7 @@ def format_truth_table(
     # Rows
     row_strs = []
     for row in rows:
-        values = ["1" if v else "0" for v in row]
+        values = ["?" if v is None else ("1" if v else "0") for v in row]
         row_str = " | ".join(
             val.center(width) for val, width in zip(values, col_widths)
         )

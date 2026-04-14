@@ -3,22 +3,24 @@ GUI Module - Visual interface for the Logic Gate Simulator
 Uses Tkinter for cross-platform compatibility
 """
 
-import tkinter as tk
+import json
 import os
-from tkinter import ttk, messagebox, scrolledtext, simpledialog
+import tkinter as tk
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 from typing import Literal, Optional, Tuple, Union
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
+
 from gates import (
-    Gate,
     AndGate,
-    OrGate,
-    NotGate,
+    Gate,
+    InputNode,
     NandGate,
     NorGate,
-    XorGate,
-    InputNode,
+    NotGate,
+    OrGate,
     OutputNode,
     Wire,
+    XorGate,
 )
 from simulation import Circuit, SimulationEngine, format_truth_table
 
@@ -31,6 +33,47 @@ Component = Union[Gate, InputNode, OutputNode]
 WireSource = Union[Gate, InputNode]
 ConnectorType = Literal["gate_output", "gate_input", "input_output", "output_input", ""]
 ComponentType = Optional[Literal["gate", "input", "output"]]
+MAX_HISTORY_STEPS = 100
+
+
+class CustomExpressionGate(Gate):
+    """Gate implementation backed by a boolean expression from API custom-gate definitions."""
+
+    def __init__(self, custom_name: str, input_names: list[str], expression: str):
+        super().__init__(custom_name, num_inputs=max(1, len(input_names)))
+        self.custom_name = custom_name
+        self.input_names = input_names if input_names else ["IN1"]
+        self.expression = expression
+
+    def get_symbol(self) -> str:
+        return self.custom_name.upper()
+
+    def compute(self) -> Optional[bool]:
+        if None in self.inputs:
+            return None
+
+        normalized = self.expression
+        normalized = normalized.replace("¬", " not ")
+        normalized = normalized.replace("∧", " and ")
+        normalized = normalized.replace("∨", " or ")
+        normalized = normalized.replace("⊕", " != ")
+
+        if normalized == "0 (Always False)":
+            return False
+        if normalized == "1 (Always True)":
+            return True
+
+        context = {
+            name: bool(value)
+            for name, value in zip(self.input_names, self.inputs)
+            if value is not None
+        }
+        context.update({"True": True, "False": False})
+
+        try:
+            return bool(eval(normalized, {"__builtins__": {}}, context))
+        except Exception:
+            return None
 
 
 class LogicGateSimulator:
@@ -81,6 +124,24 @@ class LogicGateSimulator:
         self.input_counter = 0
         self.output_counter = 0
         self.gate_counter = 0
+
+        # Auth state for protected API routes
+        self.auth_token = ""
+        self.auth_user = ""
+        self.auth_username_var = tk.StringVar(value="")
+        self.auth_password_var = tk.StringVar(value="")
+        self.auth_user_var = tk.StringVar(value="Current User: Guest")
+
+        # Custom gate state loaded from API
+        self.custom_gate_defs: dict[str, dict] = {}
+        self.custom_gate_buttons_frame: Optional[ttk.Frame] = None
+
+        # Undo/redo history
+        self.history_past: list[dict] = []
+        self.history_future: list[dict] = []
+        self.drag_start_snapshot: Optional[dict] = None
+        self.undo_btn: Optional[ttk.Button] = None
+        self.redo_btn: Optional[ttk.Button] = None
 
         self._setup_ui()
         self._bind_events()
@@ -183,6 +244,39 @@ class LogicGateSimulator:
             ).pack(fill=tk.X, pady=2)
 
         ttk.Separator(toolbox, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        ttk.Label(toolbox, text="Custom Gates", font=("Arial", 10, "bold")).pack(
+            pady=(0, 5)
+        )
+
+        ttk.Button(
+            toolbox,
+            text="Create Custom Gate",
+            style="Tool.TButton",
+            command=self._create_custom_gate_from_current_circuit,
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="Share Custom Gate",
+            style="Tool.TButton",
+            command=self._share_custom_gate,
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="Import Shared Gate",
+            style="Tool.TButton",
+            command=self._import_shared_custom_gate,
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="Refresh Custom Gates",
+            style="Tool.TButton",
+            command=self._refresh_custom_gates,
+        ).pack(fill=tk.X, pady=2)
+
+        self.custom_gate_buttons_frame = ttk.Frame(toolbox)
+        self.custom_gate_buttons_frame.pack(fill=tk.X, pady=(2, 0))
+
+        ttk.Separator(toolbox, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
 
         # Actions section
         ttk.Label(toolbox, text="Actions", font=("Arial", 10, "bold")).pack(pady=(0, 5))
@@ -194,6 +288,22 @@ class LogicGateSimulator:
             command=self._toggle_wire_mode,
         )
         self.wire_btn.pack(fill=tk.X, pady=2)
+
+        self.undo_btn = ttk.Button(
+            toolbox,
+            text="↶ Undo (Ctrl+Z)",
+            style="Tool.TButton",
+            command=self._undo,
+        )
+        self.undo_btn.pack(fill=tk.X, pady=2)
+
+        self.redo_btn = ttk.Button(
+            toolbox,
+            text="↷ Redo (Ctrl+Y)",
+            style="Tool.TButton",
+            command=self._redo,
+        )
+        self.redo_btn.pack(fill=tk.X, pady=2)
 
         ttk.Button(
             toolbox,
@@ -222,6 +332,48 @@ class LogicGateSimulator:
             style="Tool.TButton",
             command=self._show_truth_table,
         ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="⏱️ Timing Diagram",
+            style="Tool.TButton",
+            command=self._show_timing_diagram,
+        ).pack(fill=tk.X, pady=2)
+
+        ttk.Separator(toolbox, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        ttk.Label(toolbox, text="Auth", font=("Arial", 10, "bold")).pack(pady=(0, 5))
+
+        ttk.Label(toolbox, text="Username", font=("Arial", 9)).pack(anchor="w")
+        ttk.Entry(toolbox, textvariable=self.auth_username_var).pack(fill=tk.X, pady=2)
+
+        ttk.Label(toolbox, text="Password", font=("Arial", 9)).pack(anchor="w")
+        ttk.Entry(toolbox, textvariable=self.auth_password_var, show="*").pack(
+            fill=tk.X, pady=2
+        )
+
+        ttk.Button(
+            toolbox,
+            text="Register",
+            style="Tool.TButton",
+            command=self._register_auth,
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="Login",
+            style="Tool.TButton",
+            command=self._login_auth,
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="Logout",
+            style="Tool.TButton",
+            command=self._logout_auth,
+        ).pack(fill=tk.X, pady=2)
+        ttk.Label(
+            toolbox,
+            textvariable=self.auth_user_var,
+            wraplength=180,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(2, 0))
 
         ttk.Separator(toolbox, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
         ttk.Label(toolbox, text="Persistence API", font=("Arial", 10, "bold")).pack(
@@ -240,6 +392,21 @@ class LogicGateSimulator:
             style="Tool.TButton",
             command=self._load_circuit_from_api,
         ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="🔗 Share Saved Circuit",
+            style="Tool.TButton",
+            command=self._share_circuit_to_api,
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            toolbox,
+            text="🌐 Load Shared Circuit",
+            style="Tool.TButton",
+            command=self._load_shared_circuit_from_api,
+        ).pack(fill=tk.X, pady=2)
+
+        self._render_custom_gate_buttons()
+        self._update_history_button_state()
 
     def _setup_canvas(self, parent):
         """Setup the main canvas area"""
@@ -338,12 +505,374 @@ class LogicGateSimulator:
         self.canvas.bind("<Motion>", self._on_mouse_move)
         self.root.bind("<Delete>", lambda e: self._delete_selected())
         self.root.bind("<Escape>", lambda e: self._cancel_wiring())
+        self.root.bind("<Control-z>", self._on_undo_shortcut)
+        self.root.bind("<Control-y>", self._on_redo_shortcut)
+        self.root.bind("<Control-Shift-z>", self._on_redo_shortcut)
+        self.root.bind("<Control-Shift-Z>", self._on_redo_shortcut)
+
+    def _on_undo_shortcut(self, _event):
+        self._undo()
+        return "break"
+
+    def _on_redo_shortcut(self, _event):
+        self._redo()
+        return "break"
+
+    def _clone_snapshot(self, snapshot: dict) -> dict:
+        return json.loads(json.dumps(snapshot))
+
+    def _snapshot_signature(self, snapshot: dict) -> str:
+        return json.dumps(snapshot, sort_keys=True)
+
+    def _capture_snapshot(self) -> dict:
+        return self._build_api_circuit_payload()
+
+    def _push_undo_snapshot(self, snapshot: Optional[dict] = None) -> None:
+        snapshot_to_store = self._clone_snapshot(snapshot or self._capture_snapshot())
+        signature = self._snapshot_signature(snapshot_to_store)
+        if (
+            self.history_past
+            and self._snapshot_signature(self.history_past[-1]) == signature
+        ):
+            self._update_history_button_state()
+            return
+
+        self.history_past.append(snapshot_to_store)
+        if len(self.history_past) > MAX_HISTORY_STEPS:
+            self.history_past = self.history_past[-MAX_HISTORY_STEPS:]
+        self.history_future.clear()
+        self._update_history_button_state()
+
+    def _update_history_button_state(self) -> None:
+        if self.undo_btn is not None:
+            if self.history_past:
+                self.undo_btn.state(["!disabled"])
+            else:
+                self.undo_btn.state(["disabled"])
+
+        if self.redo_btn is not None:
+            if self.history_future:
+                self.redo_btn.state(["!disabled"])
+            else:
+                self.redo_btn.state(["disabled"])
+
+    def _undo(self) -> None:
+        if not self.history_past:
+            self.status_var.set("Nothing to undo")
+            self._update_history_button_state()
+            return
+
+        current = self._capture_snapshot()
+        previous = self.history_past.pop()
+        if self._snapshot_signature(current) != self._snapshot_signature(previous):
+            self.history_future.insert(0, self._clone_snapshot(current))
+            if len(self.history_future) > MAX_HISTORY_STEPS:
+                self.history_future = self.history_future[:MAX_HISTORY_STEPS]
+
+        self._apply_api_circuit_payload(self._clone_snapshot(previous))
+        self.status_var.set("Undo applied")
+        self._update_history_button_state()
+
+    def _redo(self) -> None:
+        if not self.history_future:
+            self.status_var.set("Nothing to redo")
+            self._update_history_button_state()
+            return
+
+        current = self._capture_snapshot()
+        next_snapshot = self.history_future.pop(0)
+        if self._snapshot_signature(current) != self._snapshot_signature(next_snapshot):
+            self.history_past.append(self._clone_snapshot(current))
+            if len(self.history_past) > MAX_HISTORY_STEPS:
+                self.history_past = self.history_past[-MAX_HISTORY_STEPS:]
+
+        self._apply_api_circuit_payload(self._clone_snapshot(next_snapshot))
+        self.status_var.set("Redo applied")
+        self._update_history_button_state()
+
+    def _render_custom_gate_buttons(self) -> None:
+        if self.custom_gate_buttons_frame is None:
+            return
+
+        for child in self.custom_gate_buttons_frame.winfo_children():
+            child.destroy()
+
+        if not self.custom_gate_defs:
+            ttk.Label(
+                self.custom_gate_buttons_frame,
+                text="No custom gates yet",
+                wraplength=180,
+                justify=tk.LEFT,
+            ).pack(fill=tk.X, pady=(2, 0))
+            return
+
+        for gate_name in sorted(self.custom_gate_defs.keys()):
+            gate_def = self.custom_gate_defs[gate_name]
+            input_names = gate_def.get("input_names", [])
+            ttk.Button(
+                self.custom_gate_buttons_frame,
+                text=f"{gate_name.upper()} ({len(input_names)} in)",
+                style="Tool.TButton",
+                command=lambda n=gate_name: self._add_component(f"custom:{n}"),
+            ).pack(fill=tk.X, pady=2)
+
+    def _refresh_custom_gates(self, silent: bool = False) -> None:
+        if not self._require_requests():
+            return
+
+        if not self.auth_token:
+            self.custom_gate_defs = {}
+            self._render_custom_gate_buttons()
+            if not silent:
+                self.status_var.set("Sign in to load custom gates")
+            return
+
+        try:
+            response = requests.get(
+                f"{self.API_BASE_URL}/api/custom-gates",
+                headers=self._auth_headers_optional(),
+                timeout=8,
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(
+                    response, "Could not load custom gates"
+                )
+                raise RuntimeError(detail)
+
+            gates = response.json().get("gates", [])
+            next_defs: dict[str, dict] = {}
+            for gate in gates:
+                name = str(gate.get("name", "")).strip().lower()
+                if not name:
+                    continue
+                next_defs[name] = {
+                    "name": name,
+                    "input_names": list(gate.get("input_names", [])),
+                    "expression": str(gate.get("expression", "")),
+                }
+
+            self.custom_gate_defs = next_defs
+            self._render_custom_gate_buttons()
+            if not silent:
+                self.status_var.set(
+                    f"Loaded {len(self.custom_gate_defs)} custom gate(s)"
+                )
+        except Exception as error:  # pragma: no cover - network/UI path
+            if not silent:
+                messagebox.showerror(
+                    "Custom Gates",
+                    f"Could not load custom gates.\n\n{error}",
+                )
+
+    def _create_custom_gate_from_current_circuit(self) -> None:
+        if not self._require_requests():
+            return
+
+        headers = self._auth_headers_required()
+        if headers is None:
+            return
+
+        if not self.circuit.input_nodes or not self.circuit.output_nodes:
+            messagebox.showwarning(
+                "Create Custom Gate",
+                "Add at least one input and one output before creating a custom gate.",
+            )
+            return
+
+        gate_name = simpledialog.askstring(
+            "Create Custom Gate",
+            "Enter custom gate name:",
+            parent=self.root,
+        )
+        if not gate_name:
+            return
+
+        available_outputs = [node.name for node in self.circuit.output_nodes]
+        output_name = simpledialog.askstring(
+            "Create Custom Gate",
+            (
+                "Optional: output name to derive expression from.\n"
+                f"Available outputs: {', '.join(available_outputs)}\n"
+                "Leave blank to use first output."
+            ),
+            parent=self.root,
+        )
+
+        body = {
+            "name": gate_name.strip().lower(),
+            "output_name": (output_name.strip() if output_name else None),
+            "circuit": self._build_api_circuit_payload(),
+        }
+
+        try:
+            response = requests.post(
+                f"{self.API_BASE_URL}/api/custom-gates/create",
+                headers={"Content-Type": "application/json", **headers},
+                json=body,
+                timeout=8,
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(
+                    response, "Could not create custom gate"
+                )
+                raise RuntimeError(detail)
+
+            created = response.json().get("name", gate_name.strip().lower())
+            self._refresh_custom_gates(silent=True)
+            self.status_var.set(f"Custom gate '{created}' created")
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror(
+                "Create Custom Gate Failed",
+                f"Could not create custom gate.\n\n{error}",
+            )
+
+    def _share_custom_gate(self) -> None:
+        if not self._require_requests():
+            return
+
+        headers = self._auth_headers_required()
+        if headers is None:
+            return
+
+        if not self.custom_gate_defs:
+            self._refresh_custom_gates(silent=True)
+        if not self.custom_gate_defs:
+            messagebox.showwarning("Share Custom Gate", "No custom gates to share")
+            return
+
+        available_names = sorted(self.custom_gate_defs.keys())
+        selected = simpledialog.askstring(
+            "Share Custom Gate",
+            (
+                f"Available: {', '.join(available_names)}\n\n"
+                "Enter custom gate name to share:"
+            ),
+            parent=self.root,
+        )
+        if not selected:
+            return
+        gate_name = selected.strip().lower()
+        if gate_name not in self.custom_gate_defs:
+            messagebox.showwarning(
+                "Share Custom Gate",
+                f"Custom gate '{gate_name}' is not available.",
+            )
+            return
+
+        try:
+            response = requests.post(
+                f"{self.API_BASE_URL}/api/custom-gates/share/{quote(gate_name, safe='')}",
+                headers=headers,
+                timeout=8,
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(
+                    response, "Could not share custom gate"
+                )
+                raise RuntimeError(detail)
+
+            payload = response.json()
+            share_path = str(payload.get("share_path", ""))
+            share_link = share_path
+            if share_path.startswith("/"):
+                share_link = f"{self.API_BASE_URL.rstrip('/')}{share_path}"
+
+            if share_link:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(share_link)
+
+            self.status_var.set(f"Custom gate '{gate_name}' shared")
+            messagebox.showinfo(
+                "Share Custom Gate",
+                (
+                    f"Share ID: {payload.get('share_id', '(unknown)')}\n\n"
+                    f"Link: {share_link or '(not provided)'}\n\n"
+                    "Link copied to clipboard."
+                ),
+            )
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror(
+                "Share Custom Gate Failed",
+                f"Could not share custom gate.\n\n{error}",
+            )
+
+    def _extract_gate_share_id(self, raw_value: str) -> str:
+        raw = raw_value.strip()
+        if not raw:
+            return ""
+
+        if "gateShare=" in raw:
+            try:
+                parsed = urlparse(raw)
+                share_id = parse_qs(parsed.query).get("gateShare", [""])[0]
+                if share_id:
+                    return share_id
+            except Exception:
+                pass
+            return raw.split("gateShare=", 1)[1].split("&", 1)[0]
+
+        return raw
+
+    def _import_shared_custom_gate(self) -> None:
+        if not self._require_requests():
+            return
+
+        headers = self._auth_headers_required()
+        if headers is None:
+            return
+
+        raw_share = simpledialog.askstring(
+            "Import Shared Gate",
+            "Enter custom gate share ID or link (?gateShare=...):",
+            parent=self.root,
+        )
+        if not raw_share:
+            return
+
+        share_id = self._extract_gate_share_id(raw_share)
+        if not share_id:
+            messagebox.showwarning("Import Shared Gate", "Invalid share ID or link")
+            return
+
+        rename = simpledialog.askstring(
+            "Import Shared Gate",
+            "Optional: new local name (leave blank to keep source name):",
+            parent=self.root,
+        )
+        body = {}
+        if rename and rename.strip():
+            body["name"] = rename.strip().lower()
+
+        try:
+            response = requests.post(
+                f"{self.API_BASE_URL}/api/custom-gates/import/{quote(share_id, safe='')}",
+                headers={"Content-Type": "application/json", **headers},
+                json=body,
+                timeout=8,
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(
+                    response, "Could not import shared custom gate"
+                )
+                raise RuntimeError(detail)
+
+            payload = response.json()
+            self._refresh_custom_gates(silent=True)
+            self.status_var.set(
+                f"Imported custom gate '{payload.get('name', '(unknown)')}'"
+            )
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror(
+                "Import Shared Gate Failed",
+                f"Could not import shared custom gate.\n\n{error}",
+            )
 
     def _add_component(self, component_type: str):
         """Add a new component to the circuit"""
         x, y = 100, 100 + len(self.circuit.get_all_components()) * 80
 
         if component_type == "input":
+            self._push_undo_snapshot()
             self.input_counter += 1
             node = InputNode(f"IN{self.input_counter}")
             node.move_to(x, y)
@@ -351,13 +880,41 @@ class LogicGateSimulator:
             self._draw_input_node(node)
 
         elif component_type == "output":
+            self._push_undo_snapshot()
             self.output_counter += 1
             node = OutputNode(f"OUT{self.output_counter}")
             node.move_to(x + 400, y)
             self.circuit.add_output(node)
             self._draw_output_node(node)
 
+        elif component_type.startswith("custom:"):
+            custom_name = component_type.split(":", 1)[1].strip().lower()
+            gate_def = self.custom_gate_defs.get(custom_name)
+            if gate_def is None and self.auth_token:
+                self._refresh_custom_gates(silent=True)
+                gate_def = self.custom_gate_defs.get(custom_name)
+
+            if gate_def is None:
+                messagebox.showwarning(
+                    "Custom Gate",
+                    f"Custom gate '{custom_name}' is not available. Refresh and try again.",
+                )
+                return
+
+            self._push_undo_snapshot()
+            self.gate_counter += 1
+            gate = CustomExpressionGate(
+                custom_name,
+                list(gate_def.get("input_names", [])),
+                str(gate_def.get("expression", "")),
+            )
+            gate.name = f"{custom_name.upper()}{self.gate_counter}"
+            gate.move_to(x + 150, y)
+            self.circuit.add_gate(gate)
+            self._draw_gate(gate)
+
         else:
+            self._push_undo_snapshot()
             self.gate_counter += 1
             gate_classes = {
                 "and": AndGate,
@@ -701,10 +1258,12 @@ class LogicGateSimulator:
             self.selected_item = component
             self.dragging = True
             self.drag_offset = (x - component.x, y - component.y)
+            self.drag_start_snapshot = self._capture_snapshot()
             if comp_type is not None:
                 self._update_properties(component, comp_type)
         else:
             self.selected_item = None
+            self.drag_start_snapshot = None
             self._clear_properties()
 
         self._redraw_all()
@@ -745,10 +1304,11 @@ class LogicGateSimulator:
                 else:
                     target_type = "gate"
 
+                self._push_undo_snapshot()
                 wire = Wire(self.wire_start, source_type, component, target_type, index)
                 self.circuit.add_wire(wire)
 
-                self.status_var.set(f"Wire connected!")
+                self.status_var.set("Wire connected!")
                 self._run_simulation()
             else:
                 self.status_var.set("End wire on an INPUT connector")
@@ -778,6 +1338,12 @@ class LogicGateSimulator:
 
     def _on_canvas_release(self, event):
         """Handle canvas release"""
+        if self.drag_start_snapshot is not None:
+            current_signature = self._snapshot_signature(self._capture_snapshot())
+            start_signature = self._snapshot_signature(self.drag_start_snapshot)
+            if current_signature != start_signature:
+                self._push_undo_snapshot(self.drag_start_snapshot)
+        self.drag_start_snapshot = None
         self.dragging = False
 
     def _on_double_click(self, event):
@@ -788,6 +1354,7 @@ class LogicGateSimulator:
         component, comp_type = self._find_component_at(x, y)
 
         if comp_type == "input" and isinstance(component, InputNode):
+            self._push_undo_snapshot()
             component.toggle()
             self._run_simulation()
             self._redraw_all()
@@ -854,6 +1421,8 @@ class LogicGateSimulator:
         if not self.selected_item:
             return
 
+        self._push_undo_snapshot()
+
         if isinstance(self.selected_item, Gate):
             self.circuit.remove_gate(self.selected_item)
         elif isinstance(self.selected_item, InputNode):
@@ -871,6 +1440,7 @@ class LogicGateSimulator:
         if messagebox.askyesno(
             "Clear Circuit", "Are you sure you want to clear the entire circuit?"
         ):
+            self._push_undo_snapshot()
             self.circuit.clear()
             self.selected_item = None
             self.input_counter = 0
@@ -908,6 +1478,66 @@ class LogicGateSimulator:
         text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         text.insert("1.0", table_str)
         text.config(state=tk.DISABLED)
+
+    def _show_timing_diagram(self):
+        """Generate and show timing diagram from API."""
+        if not self._require_requests():
+            return
+
+        body = {"circuit": self._build_api_circuit_payload()}
+        headers = self._auth_headers_optional()
+
+        try:
+            response = requests.post(
+                f"{self.API_BASE_URL}/api/circuit/timing",
+                json=body,
+                headers=headers,
+                timeout=8,
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(
+                    response, "Could not generate timing diagram"
+                )
+                raise RuntimeError(detail)
+
+            timing = response.json()
+            steps = timing.get("steps", [])
+            signals = timing.get("signals", [])
+            if not steps or not signals:
+                text = "Run simulation to generate a timing diagram."
+            else:
+                step_line = "Step: " + " ".join(str(step) for step in steps)
+                signal_lines = []
+                for signal in signals:
+                    name = str(signal.get("name", "signal"))
+                    values = signal.get("values", [])
+                    waveform = " ".join(
+                        "?" if value is None else ("-" if bool(value) else "_")
+                        for value in values
+                    )
+                    signal_lines.append(f"{name.ljust(10, ' ')}: {waveform}")
+                text = "\n".join([step_line, *signal_lines])
+
+            popup = tk.Toplevel(self.root)
+            popup.title("Timing Diagram")
+            popup.geometry("520x500")
+            popup.configure(bg=self.COLORS["bg"])
+
+            text_widget = scrolledtext.ScrolledText(
+                popup,
+                font=("Consolas", 12),
+                bg=self.COLORS["panel_bg"],
+                fg=self.COLORS["gate_text"],
+            )
+            text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            text_widget.insert("1.0", text)
+            text_widget.config(state=tk.DISABLED)
+            self.status_var.set("Timing diagram ready")
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror(
+                "Timing Diagram Failed",
+                f"Could not generate timing diagram.\n\n{error}",
+            )
 
     def _update_truth_table(self):
         """Update the truth table display"""
@@ -1005,18 +1635,26 @@ Position: ({component.x}, {component.y})
                 }
                 for node in self.circuit.output_nodes
             ],
-            "gates": [
+            "gates": [],
+            "wires": [],
+        }
+
+        for gate in self.circuit.gates:
+            gate_type = gate_type_map.get(type(gate))
+            if gate_type is None and isinstance(gate, CustomExpressionGate):
+                gate_type = f"custom:{gate.custom_name}"
+            if gate_type is None:
+                continue
+
+            payload["gates"].append(
                 {
                     "id": gate_ids[gate],
-                    "type": gate_type_map[type(gate)],
+                    "type": gate_type,
                     "name": gate.name,
                     "x": gate.x,
                     "y": gate.y,
                 }
-                for gate in self.circuit.gates
-            ],
-            "wires": [],
-        }
+            )
 
         for wire in self.circuit.wires:
             if isinstance(wire.source, InputNode):
@@ -1044,9 +1682,142 @@ Position: ({component.x}, {component.y})
 
         return payload
 
+    def _require_requests(self) -> bool:
+        if requests is None:
+            messagebox.showerror(
+                "Dependency Missing",
+                "The 'requests' package is required. Install it with: pip install requests",
+            )
+            return False
+        return True
+
+    def _auth_headers_required(self) -> Optional[dict]:
+        if not self.auth_token:
+            messagebox.showwarning(
+                "Authentication Required",
+                "Sign in from the Auth section before using this API action.",
+            )
+            return None
+        return {"Authorization": f"Bearer {self.auth_token}"}
+
+    def _auth_headers_optional(self) -> dict:
+        if not self.auth_token:
+            return {}
+        return {"Authorization": f"Bearer {self.auth_token}"}
+
+    def _extract_error_detail(self, response, fallback: str) -> str:
+        try:
+            payload = response.json()
+        except Exception:
+            return fallback
+
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail
+        return fallback
+
+    def _set_auth_state(self, token: str, username: str) -> None:
+        self.auth_token = token
+        self.auth_user = username
+        self.auth_user_var.set(
+            f"Current User: {username}" if username else "Current User: Guest"
+        )
+        if username:
+            self._refresh_custom_gates(silent=True)
+        else:
+            self.custom_gate_defs = {}
+            self._render_custom_gate_buttons()
+
+    def _submit_auth(self, endpoint: str) -> None:
+        if not self._require_requests():
+            return
+
+        username = self.auth_username_var.get().strip().lower()
+        password = self.auth_password_var.get().strip()
+        if not username or not password:
+            messagebox.showwarning("Authentication", "Enter username and password.")
+            return
+
+        try:
+            response = requests.post(
+                f"{self.API_BASE_URL}{endpoint}",
+                json={"username": username, "password": password},
+                timeout=8,
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(response, "Authentication failed")
+                raise RuntimeError(detail)
+
+            data = response.json()
+            token = data.get("access_token", "")
+            user = data.get("username", username)
+            if not token:
+                raise RuntimeError("Authentication token missing in server response")
+
+            self._set_auth_state(token, user)
+            self.auth_password_var.set("")
+            self.status_var.set(f"Signed in as {user}")
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror("Authentication Failed", f"{error}")
+
+    def _register_auth(self) -> None:
+        self._submit_auth("/api/auth/register")
+
+    def _login_auth(self) -> None:
+        self._submit_auth("/api/auth/login")
+
+    def _logout_auth(self) -> None:
+        self._set_auth_state("", "")
+        self.auth_password_var.set("")
+        self.status_var.set("Signed out")
+
+    def _prompt_saved_circuit_name(self, headers: dict, title: str) -> Optional[str]:
+        try:
+            list_response = requests.get(
+                f"{self.API_BASE_URL}/api/circuit/list",
+                headers=headers,
+                timeout=8,
+            )
+            if not list_response.ok:
+                detail = self._extract_error_detail(
+                    list_response, "Could not list saved circuits"
+                )
+                raise RuntimeError(detail)
+            available = list_response.json().get("circuits", [])
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror(title, f"Could not list saved circuits.\n\n{error}")
+            return None
+
+        prompt = "Enter circuit name:"
+        if available:
+            prompt = f"Available: {', '.join(available)}\n\nEnter circuit name:"
+
+        name = simpledialog.askstring(title, prompt, parent=self.root)
+        if not name:
+            return None
+        return name.strip()
+
+    def _extract_share_id(self, raw_value: str) -> str:
+        raw = raw_value.strip()
+        if not raw:
+            return ""
+
+        if "share=" in raw:
+            try:
+                parsed = urlparse(raw)
+                share_id = parse_qs(parsed.query).get("share", [""])[0]
+                if share_id:
+                    return share_id
+            except Exception:
+                pass
+            return raw.split("share=", 1)[1].split("&", 1)[0]
+
+        return raw
+
     def _apply_api_circuit_payload(self, circuit_payload: dict) -> None:
         self.circuit.clear()
         self.selected_item = None
+        self.drag_start_snapshot = None
         self._clear_properties()
 
         input_lookup = {}
@@ -1066,6 +1837,11 @@ Position: ({component.x}, {component.y})
         self.output_counter = 0
         self.gate_counter = 0
 
+        if self.auth_token:
+            self._refresh_custom_gates(silent=True)
+
+        missing_custom_gates = set()
+
         for input_spec in circuit_payload.get("inputs", []):
             node = InputNode(
                 input_spec.get("name", "IN"), input_spec.get("value", False)
@@ -1084,11 +1860,27 @@ Position: ({component.x}, {component.y})
 
         for gate_spec in circuit_payload.get("gates", []):
             gate_type = gate_spec.get("type", "and")
-            gate_class = gate_classes.get(gate_type)
-            if gate_class is None:
-                continue
+            gate = None
 
-            gate = gate_class(gate_spec.get("name", gate_type.upper()))
+            if isinstance(gate_type, str) and gate_type.startswith("custom:"):
+                custom_name = gate_type.split(":", 1)[1].strip().lower()
+                gate_def = self.custom_gate_defs.get(custom_name)
+                if gate_def is not None:
+                    gate = CustomExpressionGate(
+                        custom_name,
+                        list(gate_def.get("input_names", [])),
+                        str(gate_def.get("expression", "")),
+                    )
+                    gate.name = gate_spec.get("name", custom_name.upper())
+                else:
+                    missing_custom_gates.add(custom_name)
+                    continue
+            else:
+                gate_class = gate_classes.get(gate_type)
+                if gate_class is None:
+                    continue
+                gate = gate_class(gate_spec.get("name", str(gate_type).upper()))
+
             gate.move_to(gate_spec.get("x", 250), gate_spec.get("y", 150))
             self.circuit.add_gate(gate)
             gate_lookup[gate_spec["id"]] = gate
@@ -1120,13 +1912,22 @@ Position: ({component.x}, {component.y})
             )
 
         self._run_simulation()
+        if missing_custom_gates:
+            missing_list = ", ".join(sorted(missing_custom_gates))
+            messagebox.showwarning(
+                "Custom Gates Missing",
+                (
+                    "Some custom gates used by this circuit are not available "
+                    f"for the current desktop session: {missing_list}"
+                ),
+            )
 
     def _save_circuit_to_api(self):
-        if requests is None:
-            messagebox.showerror(
-                "Dependency Missing",
-                "The 'requests' package is required. Install it with: pip install requests",
-            )
+        if not self._require_requests():
+            return
+
+        headers = self._auth_headers_required()
+        if headers is None:
             return
 
         name = simpledialog.askstring(
@@ -1146,53 +1947,128 @@ Position: ({component.x}, {component.y})
             response = requests.post(
                 f"{self.API_BASE_URL}/api/circuit/save",
                 json=body,
+                headers=headers,
                 timeout=8,
             )
-            response.raise_for_status()
+            if not response.ok:
+                detail = self._extract_error_detail(response, "Could not save circuit")
+                raise RuntimeError(detail)
             self.status_var.set(f"Saved circuit '{name}' to API storage")
             messagebox.showinfo("Saved", f"Circuit '{name}' saved successfully.")
         except Exception as error:  # pragma: no cover - network/UI path
             messagebox.showerror("Save Failed", f"Could not save circuit.\n\n{error}")
 
     def _load_circuit_from_api(self):
-        if requests is None:
-            messagebox.showerror(
-                "Dependency Missing",
-                "The 'requests' package is required. Install it with: pip install requests",
-            )
+        if not self._require_requests():
             return
 
-        try:
-            list_response = requests.get(
-                f"{self.API_BASE_URL}/api/circuit/list", timeout=8
-            )
-            list_response.raise_for_status()
-            available = list_response.json().get("circuits", [])
-        except Exception as error:  # pragma: no cover - network/UI path
-            messagebox.showerror(
-                "Load Failed", f"Could not list saved circuits.\n\n{error}"
-            )
+        headers = self._auth_headers_required()
+        if headers is None:
             return
 
-        prompt = "Enter circuit name to load:"
-        if available:
-            prompt = f"Available: {', '.join(available)}\n\nEnter circuit name to load:"
-
-        name = simpledialog.askstring("Load Circuit", prompt, parent=self.root)
+        name = self._prompt_saved_circuit_name(headers, "Load Circuit")
         if not name:
             return
 
         try:
             encoded_name = quote(name.strip(), safe="")
             response = requests.get(
-                f"{self.API_BASE_URL}/api/circuit/load/{encoded_name}", timeout=8
+                f"{self.API_BASE_URL}/api/circuit/load/{encoded_name}",
+                headers=headers,
+                timeout=8,
             )
-            response.raise_for_status()
+            if not response.ok:
+                detail = self._extract_error_detail(response, "Could not load circuit")
+                raise RuntimeError(detail)
             payload = response.json().get("circuit", {})
+            self._push_undo_snapshot()
             self._apply_api_circuit_payload(payload)
             self.status_var.set(f"Loaded circuit '{name}' from API storage")
         except Exception as error:  # pragma: no cover - network/UI path
             messagebox.showerror("Load Failed", f"Could not load circuit.\n\n{error}")
+
+    def _share_circuit_to_api(self):
+        if not self._require_requests():
+            return
+
+        headers = self._auth_headers_required()
+        if headers is None:
+            return
+
+        name = self._prompt_saved_circuit_name(headers, "Share Circuit")
+        if not name:
+            return
+
+        try:
+            encoded_name = quote(name, safe="")
+            response = requests.post(
+                f"{self.API_BASE_URL}/api/circuit/share/{encoded_name}",
+                headers=headers,
+                timeout=8,
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(response, "Could not share circuit")
+                raise RuntimeError(detail)
+
+            data = response.json()
+            share_path = str(data.get("share_path", ""))
+            share_link = share_path
+            if share_path.startswith("/"):
+                share_link = f"{self.API_BASE_URL.rstrip('/')}{share_path}"
+
+            if share_link:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(share_link)
+
+            self.status_var.set(f"Share link created for '{name}'")
+            messagebox.showinfo(
+                "Share Circuit",
+                (
+                    f"Share ID: {data.get('share_id', '(unknown)')}\n\n"
+                    f"Link: {share_link or '(not provided)'}\n\n"
+                    "Link copied to clipboard."
+                ),
+            )
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror("Share Failed", f"Could not share circuit.\n\n{error}")
+
+    def _load_shared_circuit_from_api(self):
+        if not self._require_requests():
+            return
+
+        raw_share = simpledialog.askstring(
+            "Load Shared Circuit",
+            "Enter share ID or full link (?share=...):",
+            parent=self.root,
+        )
+        if not raw_share:
+            return
+
+        share_id = self._extract_share_id(raw_share)
+        if not share_id:
+            messagebox.showwarning("Load Shared Circuit", "Invalid share ID or link.")
+            return
+
+        try:
+            encoded_share_id = quote(share_id, safe="")
+            response = requests.get(
+                f"{self.API_BASE_URL}/api/public/circuit/{encoded_share_id}", timeout=8
+            )
+            if not response.ok:
+                detail = self._extract_error_detail(
+                    response, "Could not load shared circuit"
+                )
+                raise RuntimeError(detail)
+
+            payload = response.json().get("circuit", {})
+            self._push_undo_snapshot()
+            self._apply_api_circuit_payload(payload)
+            self.status_var.set("Loaded shared circuit")
+        except Exception as error:  # pragma: no cover - network/UI path
+            messagebox.showerror(
+                "Load Shared Failed",
+                f"Could not load shared circuit.\n\n{error}",
+            )
 
     def _clear_properties(self):
         """Clear the properties panel"""
