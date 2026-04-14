@@ -2,7 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 const frontendURL = process.env.BASE_URL || "http://127.0.0.1:5173";
 const frontendPort = new URL(frontendURL).port || "5173";
-const pythonCommand = process.platform === "win32" ? "py -3" : "python3";
+const pythonCommand =
+  process.env.LOGIC_E2E_PYTHON ||
+  (process.platform === "win32" ? "python" : "python3");
 
 export default defineConfig({
   testDir: "./e2e",

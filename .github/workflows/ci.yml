@@ -81,6 +81,8 @@ jobs:
         run: npm ci
 
       - name: Run web E2E suite (desktop + mobile)
+        env:
+          LOGIC_E2E_PYTHON: python
         run: npm run test:e2e
 
       - name: Upload Playwright report
