@@ -163,6 +163,15 @@ python -m unittest -v
 # Build-check the web frontend
 cd frontend
 npm run build
+
+# Run full web UI E2E suite (desktop + mobile, Playwright)
+npm run test:e2e
+
+# Run only desktop web UI E2E
+npm run test:e2e:desktop
+
+# Run only mobile web UI E2E
+npm run test:e2e:mobile
 ```
 
 ### CI on Push
@@ -171,6 +180,7 @@ GitHub Actions workflow is configured in `.github/workflows/ci.yml` to run autom
 
 - Python job: installs `requirements.txt` and runs `python -m unittest -v`
 - Frontend job: runs `npm ci` and `npm run build` in `frontend/`
+- Web E2E job: runs Playwright against preinstalled Microsoft Edge (`channel: msedge`) and executes `npm run test:e2e` (desktop + mobile)
 
 ### Free Cloud Deployment (Render + Vercel)
 

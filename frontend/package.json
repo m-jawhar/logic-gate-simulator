@@ -6,7 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "playwright test --project=desktop-edge --project=mobile-edge",
+    "test:e2e:desktop": "playwright test --project=desktop-edge",
+    "test:e2e:desktop:headed": "playwright test --project=desktop-edge --headed",
+    "test:e2e:mobile": "playwright test --project=mobile-edge",
+    "test:e2e:mobile:headed": "playwright test --project=mobile-edge --headed"
   },
   "dependencies": {
     "prop-types": "^15.8.1",
@@ -14,6 +19,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@vitejs/plugin-react": "^4.3.2",
     "vite": "^5.4.10"
   }
