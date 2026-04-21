@@ -3,14 +3,13 @@
 A graphical application for designing and simulating digital logic circuits, demonstrating the hardware-software interface from Logic System Design.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
-![Tkinter](https://img.shields.io/badge/GUI-Tkinter-green.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-## 🎯 Project Overview
+##  Project Overview
 
 This project synthesizes knowledge from **Logic System Design (B24CS1T01)** with programming skills. It translates abstract Boolean algebra into a visual, functional tool.
 
-## ✨ Features
+##  Features
 
 ### 1. Canvas Area
 
@@ -58,7 +57,7 @@ Gate (Abstract Base Class)
 - Web wiring uses connector-to-connector click flow in **Wire Mode** (desktop-style), not a separate wire form
 - Tkinter app includes **Save To API** and **Load From API** buttons
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### Prerequisites
 
@@ -313,7 +312,7 @@ Notes:
 - Use the **service role key** only on the backend (never expose in frontend).
 - If Supabase vars are not set, the API automatically falls back to local file storage for circuits, auth users, custom gates, and shared custom gates.
 
-## 📖 How to Use
+##  How to Use
 
 ### Adding Components
 
@@ -343,7 +342,7 @@ Notes:
 - Click **"🗑️ Delete Selected"** to remove selection
 - Click **"🔄 Clear Circuit"** to start fresh
 
-## 📊 Boolean Algebra Review
+##  Boolean Algebra Review
 
 ### Basic Gates
 
@@ -366,7 +365,7 @@ Input A ──┬──[AND]──────────> Carry
 Input B ──┴──┘
 ```
 
-## 🏗️ Project Structure
+##  Project Structure
 
 ```
 LogicGateSimulator/
@@ -383,7 +382,7 @@ LogicGateSimulator/
 └── README.md        # This file
 ```
 
-## 🎓 Educational Value
+##  Educational Value
 
 This project demonstrates:
 
@@ -407,7 +406,7 @@ This project demonstrates:
    - Clean code organization
    - Documentation
 
-## 📝 Future Enhancements
+##  Future Enhancements
 
 - [ ] Durable cloud persistence (database/object store)
 - [ ] Timing diagrams
@@ -416,11 +415,11 @@ This project demonstrates:
 - [ ] Custom gate creation
 - [ ] Undo/Redo functionality
 
-## 📜 License
+##  License
 
 MIT License - Feel free to use for educational purposes.
 
-## 👨‍💻 Author
+##  Author
 
 Created for Logic System Design (B24CS1T01) coursework.
 
